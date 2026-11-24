@@ -6,7 +6,7 @@ _aiup_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  opts="-h --help -v --version -l --list -c --check --cli --desktop -o --only -s --skip --json --force-git --no-color"
+  opts="-h --help -v --version -l --list -c --check -S --sudo --no-sudo --cli --desktop -o --only -s --skip --json --force-git --no-color"
   targets="agy claude codex hermes opencode mimo kilo goose uv-tools npm-globals chatgpt opencode-desktop aionui antigravity-desktop cowork-os orkas hermes-desktop"
 
   case "$prev" in

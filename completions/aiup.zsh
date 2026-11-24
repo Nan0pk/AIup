@@ -8,6 +8,8 @@ _aiup() {
     '(-v --version)'{-v,--version}'[Show version number]'
     '(-l --list)'{-l,--list}'[List detected AI apps and installed versions]'
     '(-c --check)'{-c,--check}'[Dry-run check for available updates]'
+    '(-S --sudo)'{-S,--sudo}'[Pre-authenticate sudo upfront at startup]'
+    '--no-sudo[Disable all sudo prompts (skip/cache privileged updates)]'
     '--cli[Only target CLI harnesses and agent runtimes]'
     '--desktop[Only target Desktop AI apps and UI workspaces]'
     '(-o --only)'{-o,--only}'[Only update specified target(s)]:target:_aiup_targets'

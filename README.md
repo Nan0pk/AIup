@@ -97,6 +97,12 @@ aiup
 # Fast alias
 uai
 
+# Pre-authenticate sudo upfront at startup for an uninterrupted batch
+aiup -S
+
+# Disable all sudo prompts (leaves privileged updates cached for later)
+aiup --no-sudo
+
 # Dry-run check for updates without modifying files
 aiup -c
 
@@ -126,6 +132,7 @@ aiup -c --json
 
 ## 🛡️ Safety & Architecture
 
+- **Intelligent Privilege Elevation**: Sudo authentication can occur upfront at the start of a run (if privileged desktop apps are scheduled) or just-in-time when an update requires root (`rpm -U`, `dnf upgrade`). An active keep-alive prevents credential timeouts during long downloads. In dry-run (`-c`), inventory list (`-l`), or CLI-only scopes, root authorization is never requested.
 - **Working Tree Preservation**: Detects uncommitted changes in local git checkouts (`~/CoWork-OS`, `~/Orkas`) and skips auto-pulls by default to protect in-flight development work.
 - **NPM Symlink Protection**: Updates global packages individually without breaking local `npm link` references (such as symlinked local AI repos).
 - **Graceful Failure Isolation**: Each harness runs in an isolated sub-process. Upstream network failures or temporary auth challenges in one tool never block updating the rest of your stack.

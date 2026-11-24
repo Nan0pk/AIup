@@ -93,6 +93,9 @@ MODE="update"     # "update", "check", "list"
 FILTER_TYPE="all" # "all", "cli", "desktop"
 OUTPUT_FORMAT="text" # "text", "json"
 FORCE_GIT=0
+FORCE_PREAUTH=0
+NO_SUDO=0
+SUDO_KEEP_ALIVE_PID=""
 declare -a ONLY_TARGETS=()
 declare -a SKIP_TARGETS=()
 
@@ -111,6 +114,8 @@ usage() {
   echo -e "    ${CYAN}-v, --version${RESET}         Show version number"
   echo -e "    ${CYAN}-l, --list${RESET}            List all detected CLI and Desktop AI apps & versions"
   echo -e "    ${CYAN}-c, --check${RESET}           Dry-run check for available updates without applying"
+  echo -e "    ${CYAN}-S, --sudo${RESET}            Pre-authenticate sudo upfront at startup for unattended sync"
+  echo -e "    ${CYAN}--no-sudo${RESET}             Disable all sudo prompts (skip or cache privileged updates)"
   echo -e "    ${CYAN}--cli${RESET}                 Only target CLI harnesses and agent runtimes"
   echo -e "    ${CYAN}--desktop${RESET}             Only target Desktop AI apps and UI workspaces"
   echo -e "    ${CYAN}-o, --only <names>${RESET}    Only update specified targets (comma-separated)"
@@ -127,6 +132,7 @@ usage() {
   echo "    aiup                    # Update everything with live progress"
   echo "    aiup -l                 # Sleek dashboard of all installed versions"
   echo "    aiup -c                 # Check update availability without touching files"
+  echo "    aiup -S                 # Pre-authenticate sudo at start for uninterrupted batch"
   echo "    aiup --desktop          # Update only desktop AI applications"
   echo "    aiup -o chatgpt,claude  # Target specific apps"
   echo "    aiup -c --json          # Output results as JSON for automations"
@@ -149,6 +155,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     -c|--check)
       MODE="check"
+      shift
+      ;;
+    -S|--sudo)
+      FORCE_PREAUTH=1
+      shift
+      ;;
+    --no-sudo)
+      NO_SUDO=1
       shift
       ;;
     --cli)
@@ -310,18 +324,30 @@ stream_progress() {
   done
 }
 
+keep_sudo_alive() {
+  if [[ -z "${SUDO_KEEP_ALIVE_PID:-}" ]]; then
+    while true; do
+      sudo -n true 2>/dev/null || exit 0
+      sleep 50
+    done 2>/dev/null &
+    SUDO_KEEP_ALIVE_PID=$!
+    trap '[[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]] && kill "$SUDO_KEEP_ALIVE_PID" 2>/dev/null || true' EXIT
+  fi
+}
+
 run_privileged() {
   local prompt_desc="${1:-system update}"
   shift || true
 
   # 1. Non-interactive or already authenticated sudo session
   if sudo -n true 2>/dev/null; then
+    keep_sudo_alive
     sudo "$@"
     return $?
   fi
 
-  # Skip interactive prompts if explicitly marked non-interactive
-  if [[ "${CI:-}" == "true" || "${DEBIAN_FRONTEND:-}" == "noninteractive" || "${AIUP_NONINTERACTIVE:-}" == "1" ]]; then
+  # Skip interactive prompts if explicitly marked non-interactive or --no-sudo
+  if [[ $NO_SUDO -eq 1 || "${CI:-}" == "true" || "${DEBIAN_FRONTEND:-}" == "noninteractive" || "${AIUP_NONINTERACTIVE:-}" == "1" ]]; then
     return 2
   fi
 
@@ -329,6 +355,7 @@ run_privileged() {
   if [[ -t 0 ]]; then
     log_step "Administrator privileges required for ${prompt_desc}"
     if sudo -v </dev/tty >/dev/tty 2>&1; then
+      keep_sudo_alive
       sudo "$@"
       return $?
     fi
@@ -343,6 +370,62 @@ run_privileged() {
   fi
 
   return 2
+}
+
+preauth_sudo_if_safe() {
+  # Never in check or list mode
+  [[ "$MODE" != "update" ]] && return 0
+
+  # Never if user explicitly disabled sudo
+  [[ $NO_SUDO -eq 1 ]] && return 0
+
+  # Never in automated/CI runs unless forced
+  if [[ $FORCE_PREAUTH -eq 0 ]]; then
+    [[ "${CI:-}" == "true" || "${DEBIAN_FRONTEND:-}" == "noninteractive" || "${AIUP_NONINTERACTIVE:-}" == "1" ]] && return 0
+  fi
+
+  # Only if running interactively in a terminal
+  [[ ! -t 0 ]] && return 0
+
+  # Check if privileged targets are included in this run
+  local has_privileged=0
+  if (rpm -q chatgpt &>/dev/null || [[ -d "/Applications/ChatGPT.app" ]]) && should_run "chatgpt" "desktop"; then
+    has_privileged=1
+  fi
+  if (rpm -q opencode &>/dev/null || [[ -d "/opt/OpenCode" ]]) && should_run "opencode-desktop" "desktop"; then
+    has_privileged=1
+  fi
+
+  # If not forced with -S/--sudo, only pre-auth if privileged apps are queued
+  if [[ $FORCE_PREAUTH -eq 0 && $has_privileged -eq 0 ]]; then
+    return 0
+  fi
+
+  # If sudo is already cached/active, keep it warm and return
+  if sudo -n true 2>/dev/null; then
+    keep_sudo_alive
+    return 0
+  fi
+
+  # Safe interactive startup pre-auth
+  if [[ "$OUTPUT_FORMAT" != "json" ]]; then
+    echo -e "${DIM}┌──${RESET} ${BOLD}${CYAN}🔒 Administrator Privileges (sudo)${RESET}"
+    echo -e "  ${DIM}│${RESET}   ${GRAY}↳${RESET} ${LIGHT_GRAY}Privileged system targets included in sync${RESET}"
+    echo -e "  ${DIM}│${RESET}   ${GRAY}↳${RESET} ${LIGHT_GRAY}Authenticating upfront for seamless unattended run...${RESET}"
+  fi
+
+  if sudo -v </dev/tty >/dev/tty 2>&1; then
+    keep_sudo_alive
+    if [[ "$OUTPUT_FORMAT" != "json" ]]; then
+      echo -e "  ${DIM}└──${RESET} ${GREEN}✔ Sudo session established (active keep-alive)${RESET}\n"
+    fi
+    return 0
+  else
+    if [[ "$OUTPUT_FORMAT" != "json" ]]; then
+      echo -e "  ${DIM}└──${RESET} ${YELLOW}⚠ Sudo pre-auth skipped — will request when needed${RESET}\n"
+    fi
+    return 1
+  fi
 }
 
 get_asar_version() {
@@ -561,6 +644,9 @@ if [[ "$OUTPUT_FORMAT" != "json" ]]; then
   fi
   echo -e "${BOLD}${CYAN}╰──────────────────────────────────────────────────────────────╯${RESET}\n"
 fi
+
+# Pre-authenticate administrator privileges upfront if safe and applicable
+preauth_sudo_if_safe
 
 # ==============================================================================
 # SECTION 1: CLI HARNESSES & AGENTS
