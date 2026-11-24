@@ -6,8 +6,8 @@ _aiup_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  opts="-h --help -v --version -l --list -c --check -S --sudo --no-sudo --cli --desktop -o --only -s --skip --json --force-git --no-color"
-  targets="agy claude codex hermes opencode mimo kilo goose uv-tools npm-globals chatgpt opencode-desktop aionui antigravity-desktop cowork-os orkas hermes-desktop"
+  opts="-h --help -v --version -l --list -c --check -C --clean --debloat --no-clean -S --sudo --no-sudo --cli --desktop -o --only -s --skip --json --force-git --no-color"
+  targets="agy claude codex hermes opencode mimo kilo goose uv-tools npm-globals chatgpt opencode-desktop aionui antigravity-desktop cowork-os orkas hermes-desktop clean-uv clean-npm clean-pip clean-installers clean-git clean-electron clean-dnf clean-dumps"
 
   case "$prev" in
     -o|--only|-s|--skip)

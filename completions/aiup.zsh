@@ -8,6 +8,8 @@ _aiup() {
     '(-v --version)'{-v,--version}'[Show version number]'
     '(-l --list)'{-l,--list}'[List detected AI apps and installed versions]'
     '(-c --check)'{-c,--check}'[Dry-run check for available updates]'
+    '(-C --clean)'{-C,--clean}'[Perform housekeeping, cache purge & system debloat only]'
+    '--no-clean[Skip post-update housekeeping and cache debloat]'
     '(-S --sudo)'{-S,--sudo}'[Pre-authenticate sudo upfront at startup]'
     '--no-sudo[Disable all sudo prompts (skip/cache privileged updates)]'
     '--cli[Only target CLI harnesses and agent runtimes]'
@@ -42,6 +44,14 @@ _aiup_targets() {
     'cowork-os:CoWork-OS Desktop and repo'
     'orkas:Orkas Desktop Client'
     'hermes-desktop:Hermes Desktop UI'
+    'clean-uv:Prune Python uv cache & environments'
+    'clean-npm:Verify npm cache & purge debug logs'
+    'clean-pip:Purge Python pip wheel cache'
+    'clean-installers:Clean installed desktop updater packages'
+    'clean-git:Optimize and pack local AI git repositories'
+    'clean-electron:Prune stale cached electron archives'
+    'clean-dnf:Prune system package manager cache'
+    'clean-dumps:Purge stale crash minidumps'
   )
   _describe 'target' targets
 }

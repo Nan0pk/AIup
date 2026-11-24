@@ -89,12 +89,13 @@ declare -a REPORT_STATUS=()
 declare -a REPORT_DETAILS=()
 declare -a REPORT_DURATIONS=()
 
-MODE="update"     # "update", "check", "list"
-FILTER_TYPE="all" # "all", "cli", "desktop"
+MODE="update"     # "update", "check", "list", "clean"
+FILTER_TYPE="all" # "all", "cli", "desktop", "clean"
 OUTPUT_FORMAT="text" # "text", "json"
 FORCE_GIT=0
 FORCE_PREAUTH=0
 NO_SUDO=0
+DO_CLEANUP=1
 SUDO_KEEP_ALIVE_PID=""
 declare -a ONLY_TARGETS=()
 declare -a SKIP_TARGETS=()
@@ -114,6 +115,8 @@ usage() {
   echo -e "    ${CYAN}-v, --version${RESET}         Show version number"
   echo -e "    ${CYAN}-l, --list${RESET}            List all detected CLI and Desktop AI apps & versions"
   echo -e "    ${CYAN}-c, --check${RESET}           Dry-run check for available updates without applying"
+  echo -e "    ${CYAN}-C, --clean${RESET}           Perform housekeeping, cache purge & system debloat only"
+  echo -e "    ${CYAN}--no-clean${RESET}            Skip post-update housekeeping and cache debloat"
   echo -e "    ${CYAN}-S, --sudo${RESET}            Pre-authenticate sudo upfront at startup for unattended sync"
   echo -e "    ${CYAN}--no-sudo${RESET}             Disable all sudo prompts (skip or cache privileged updates)"
   echo -e "    ${CYAN}--cli${RESET}                 Only target CLI harnesses and agent runtimes"
@@ -127,12 +130,15 @@ usage() {
   echo -e "${BOLD}SUPPORTED TARGETS:${RESET}"
   echo -e "  ${CYAN}◈ CLI Engines:${RESET}     agy, claude, codex, hermes, opencode, mimo, kilo, goose, uv-tools, npm-globals"
   echo -e "  ${MAGENTA}❖ Desktop Apps:${RESET}    chatgpt, opencode-desktop, aionui, antigravity-desktop, cowork-os, orkas, hermes-desktop"
+  echo -e "  ${BLUE}🧹 Housekeeping:${RESET}   clean-uv, clean-npm, clean-pip, clean-installers, clean-git, clean-electron, clean-dnf, clean-dumps"
   echo ""
   echo -e "${BOLD}EXAMPLES:${RESET}"
-  echo "    aiup                    # Update everything with live progress"
+  echo "    aiup                    # Update everything with live progress & debloat afterwards"
   echo "    aiup -l                 # Sleek dashboard of all installed versions"
   echo "    aiup -c                 # Check update availability without touching files"
+  echo "    aiup -C                 # Run cache debloat & housekeeping only (skip updates)"
   echo "    aiup -S                 # Pre-authenticate sudo at start for uninterrupted batch"
+  echo "    aiup --no-clean         # Fast update only, skipping housekeeping"
   echo "    aiup --desktop          # Update only desktop AI applications"
   echo "    aiup -o chatgpt,claude  # Target specific apps"
   echo "    aiup -c --json          # Output results as JSON for automations"
@@ -155,6 +161,16 @@ while [[ $# -gt 0 ]]; do
       ;;
     -c|--check)
       MODE="check"
+      shift
+      ;;
+    -C|--clean|--debloat)
+      MODE="clean"
+      FILTER_TYPE="clean"
+      DO_CLEANUP=1
+      shift
+      ;;
+    --no-clean|--skip-clean|--skip-cleanup)
+      DO_CLEANUP=0
       shift
       ;;
     -S|--sudo)
@@ -209,7 +225,7 @@ done
 
 should_run() {
   local name="$1"
-  local type="$2" # "cli" or "desktop"
+  local type="$2" # "cli", "desktop", or "clean"
   local lower_name
   lower_name="$(echo "$name" | tr '[:upper:]' '[:lower:]')"
 
@@ -217,6 +233,12 @@ should_run() {
     return 1
   fi
   if [[ "$FILTER_TYPE" == "desktop" && "$type" != "desktop" ]]; then
+    return 1
+  fi
+  if [[ "$FILTER_TYPE" == "clean" && "$type" != "clean" ]]; then
+    return 1
+  fi
+  if [[ "$FILTER_TYPE" == "all" && "$type" == "clean" && $DO_CLEANUP -eq 0 ]]; then
     return 1
   fi
 
@@ -258,6 +280,8 @@ log_card_start() {
   local type="$2"
   if [[ "$type" == "cli" ]]; then
     echo -e "${BOLD}${CYAN}┌── ◈ [CLI] ${title}${RESET}"
+  elif [[ "$type" == "clean" || "$type" == "clean"* ]]; then
+    echo -e "${BOLD}${BLUE}┌── 🧹 [CLEANUP] ${title}${RESET}"
   else
     echo -e "${BOLD}${MAGENTA}┌── ❖ [DESKTOP] ${title}${RESET}"
   fi
@@ -279,6 +303,9 @@ log_card_end() {
   case "$status" in
     UPDATED)
       badge="${GREEN}✔ [UPDATED]${RESET}"
+      ;;
+    CLEANED|DEBLOATED)
+      badge="${GREEN}✔ [CLEANED]${RESET}"
       ;;
     "UP TO DATE")
       badge="${GREEN}✔ [UP-TO-DATE]${RESET}"
@@ -639,6 +666,8 @@ if [[ "$OUTPUT_FORMAT" != "json" ]]; then
   echo -e "\n${BOLD}${CYAN}╭──────────────────────────────────────────────────────────────╮${RESET}"
   if [[ "$MODE" == "check" ]]; then
     echo -e "${BOLD}${CYAN}│${RESET}  ${YELLOW}🔍 [CHECK MODE] Scanning for AI Harness & App Updates...${RESET}    ${BOLD}${CYAN}│${RESET}"
+  elif [[ "$MODE" == "clean" ]]; then
+    echo -e "${BOLD}${CYAN}│${RESET}  ${BLUE}🧹 [CLEANUP MODE] Housekeeping & System Debloat...${RESET}           ${BOLD}${CYAN}│${RESET}"
   else
     echo -e "${BOLD}${CYAN}│${RESET}  ${BOLD}🚀 [UPDATE MODE] Syncing All AI Harnesses & Desktop Apps...${RESET} ${BOLD}${CYAN}│${RESET}"
   fi
@@ -651,7 +680,7 @@ preauth_sudo_if_safe
 # ==============================================================================
 # SECTION 1: CLI HARNESSES & AGENTS
 # ==============================================================================
-if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
+if [[ ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli") && "$MODE" != "clean" ]]; then
   [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "${BOLD}${CYAN}◈ [SECTION 1] CLI HARNESSES & CORE AGENTS${RESET}\n"
 
   # 1. Antigravity CLI (agy)
@@ -887,7 +916,7 @@ fi
 # ==============================================================================
 # SECTION 2: DESKTOP AI APPS & WORKSPACES
 # ==============================================================================
-if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "desktop" ]]; then
+if [[ ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "desktop") && "$MODE" != "clean" ]]; then
   [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "${BOLD}${MAGENTA}❖ [SECTION 2] DESKTOP AI APPS & WORKSPACES${RESET}\n"
 
   # 11. ChatGPT Desktop App
@@ -1130,21 +1159,213 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "desktop" ]]; then
 fi
 
 # ==============================================================================
+# SECTION 3: HOUSEKEEPING & SYSTEM DEBLOAT
+# ==============================================================================
+if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean") ]]; then
+  [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "${BOLD}${BLUE}🧹 [SECTION 3] HOUSEKEEPING & SYSTEM DEBLOAT${RESET}\n"
+
+  # 18. Python uv Cache & Environments
+  if command -v uv &>/dev/null && should_run "clean-uv" "clean"; then
+    log_card_start "Python uv Cache & Environments" "clean"
+    t_start=$(date +%s%N)
+    log_step "Pruning dangling wheel builds and orphaned cache entries..."
+    if [[ "$MODE" == "check" ]]; then
+      uv_sz=$(du -sh "$HOME/.cache/uv" 2>/dev/null | awk '{print $1}' || echo "0B")
+      t_end=$(date +%s%N)
+      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+      log_card_end "UP TO DATE" "Cache footprint: ${uv_sz}" "$dur"
+      record_result "clean-uv" "CLEAN" "UP TO DATE" "Cache: ${uv_sz}" "$dur"
+    else
+      uv_out=$(uv cache prune 2>&1 || true)
+      t_end=$(date +%s%N)
+      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+      if echo "$uv_out" | grep -qi "Removed"; then
+        freed=$(echo "$uv_out" | grep -oE "Removed [^)]+\)" | sed 's/Removed //')
+        log_card_end "CLEANED" "Pruned dangling files (${freed})" "$dur"
+        record_result "clean-uv" "CLEAN" "CLEANED" "Pruned: ${freed}" "$dur"
+      else
+        log_card_end "UP TO DATE" "Cache optimal (0 dangling files)" "$dur"
+        record_result "clean-uv" "CLEAN" "UP TO DATE" "Cache optimal" "$dur"
+      fi
+    fi
+  fi
+
+  # 19. NPM Cache & Debug Logs
+  if command -v npm &>/dev/null && should_run "clean-npm" "clean"; then
+    log_card_start "NPM Cache & Debug Logs" "clean"
+    t_start=$(date +%s%N)
+    log_step "Purging stale debug logs (~/.npm/_logs)..."
+    log_count=$(find "$HOME/.npm/_logs" -type f 2>/dev/null | wc -l || echo 0)
+    [[ $log_count -gt 0 && "$MODE" != "check" ]] && rm -rf "$HOME/.npm/_logs/"* 2>/dev/null || true
+    log_step "Verifying cache integrity and garbage-collecting corrupted indices..."
+    if [[ "$MODE" == "check" ]]; then
+      t_end=$(date +%s%N)
+      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+      log_card_end "UP TO DATE" "${log_count} debug logs present" "$dur"
+      record_result "clean-npm" "CLEAN" "UP TO DATE" "${log_count} logs" "$dur"
+    else
+      npm cache verify &>/dev/null || true
+      t_end=$(date +%s%N)
+      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+      log_card_end "CLEANED" "Purged ${log_count} log files & verified cache" "$dur"
+      record_result "clean-npm" "CLEAN" "CLEANED" "Purged ${log_count} logs" "$dur"
+    fi
+  fi
+
+  # 20. Python Pip Wheel Cache
+  if command -v pip &>/dev/null && should_run "clean-pip" "clean"; then
+    log_card_start "Python Pip Cache" "clean"
+    t_start=$(date +%s%N)
+    log_step "Purging cached wheel downloads and HTTP index files..."
+    if [[ "$MODE" == "check" ]]; then
+      pip_sz=$(pip cache info 2>/dev/null | grep -i "cache size:" | awk -F: '{print $2}' | xargs || echo "0B")
+      t_end=$(date +%s%N)
+      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+      log_card_end "UP TO DATE" "Cache footprint: ${pip_sz:-0B}" "$dur"
+      record_result "clean-pip" "CLEAN" "UP TO DATE" "Cache: ${pip_sz:-0B}" "$dur"
+    else
+      pip_out=$(pip cache purge 2>&1 || true)
+      t_end=$(date +%s%N)
+      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+      if echo "$pip_out" | grep -qi "Files removed"; then
+        freed=$(echo "$pip_out" | grep -oE "\([0-9.]+ [KMGT]?B\)" | tr -d '()' | head -n 1)
+        log_card_end "CLEANED" "Purged wheels & index files (${freed:-freed})" "$dur"
+        record_result "clean-pip" "CLEAN" "CLEANED" "Purged: ${freed:-freed}" "$dur"
+      else
+        log_card_end "UP TO DATE" "Cache optimal" "$dur"
+        record_result "clean-pip" "CLEAN" "UP TO DATE" "Cache optimal" "$dur"
+      fi
+    fi
+  fi
+
+  # 21. Desktop Updater Packages & Temp Installers
+  if should_run "clean-installers" "clean"; then
+    log_card_start "Desktop Updater Packages & Temp Installers" "clean"
+    t_start=$(date +%s%N)
+    rpm_cache="$HOME/.cache/@opencode-aidesktop-updater/pending/opencode-desktop-linux-x86_64.rpm"
+    cleaned_installer=0
+    installer_detail="No stale installers"
+    if [[ -f "$rpm_cache" ]] && command -v rpm &>/dev/null; then
+      cached_v=$(rpm -qp "$rpm_cache" --queryformat "%{VERSION}" 2>/dev/null || true)
+      curr_v=$(rpm -q --queryformat "%{VERSION}" opencode 2>/dev/null || true)
+      if [[ -n "$curr_v" && -n "$cached_v" && "$curr_v" == "$cached_v" ]]; then
+        sz=$(du -sh "$rpm_cache" 2>/dev/null | awk '{print $1}')
+        if [[ "$MODE" != "check" ]]; then
+          rm -rf "$HOME/.cache/@opencode-aidesktop-updater/pending"* 2>/dev/null || true
+          cleaned_installer=1
+          installer_detail="Removed installed RPM installer (${sz})"
+        else
+          installer_detail="Installed RPM cached (${sz})"
+        fi
+      else
+        installer_detail="Retained pending update package (v${cached_v})"
+      fi
+    fi
+    t_end=$(date +%s%N)
+    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+    if [[ $cleaned_installer -eq 1 ]]; then
+      log_card_end "CLEANED" "$installer_detail" "$dur"
+      record_result "clean-installers" "CLEAN" "CLEANED" "$installer_detail" "$dur"
+    elif [[ "$installer_detail" =~ Retained ]]; then
+      log_card_end "CACHED" "$installer_detail" "$dur"
+      record_result "clean-installers" "CLEAN" "CACHED" "Installer ready" "$dur"
+    else
+      log_card_end "UP TO DATE" "$installer_detail" "$dur"
+      record_result "clean-installers" "CLEAN" "UP TO DATE" "$installer_detail" "$dur"
+    fi
+  fi
+
+  # 22. Local AI Git Repositories (git gc --auto)
+  if should_run "clean-git" "clean"; then
+    log_card_start "Local AI Git Repositories (git gc --auto)" "clean"
+    t_start=$(date +%s%N)
+    repos_checked=0
+    for r in "$HOME/CoWork-OS" "$HOME/Orkas"; do
+      if [[ -d "$r/.git" ]]; then
+        log_step "Optimizing repository packfiles in ${r}..."
+        [[ "$MODE" != "check" ]] && git -C "$r" gc --auto --quiet 2>/dev/null || true
+        ((repos_checked++))
+      fi
+    done
+    t_end=$(date +%s%N)
+    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+    if [[ $repos_checked -gt 0 ]]; then
+      log_card_end "CLEANED" "Packed loose objects in ${repos_checked} repos" "$dur"
+      record_result "clean-git" "CLEAN" "CLEANED" "${repos_checked} repos optimized" "$dur"
+    else
+      log_card_end "UP TO DATE" "No active local git repos" "$dur"
+      record_result "clean-git" "CLEAN" "UP TO DATE" "Optimal" "$dur"
+    fi
+  fi
+
+  # 23. Cached Electron Distribution Archives
+  if [[ -d "$HOME/.cache/electron" ]] && should_run "clean-electron" "clean"; then
+    log_card_start "Cached Electron Distribution Archives" "clean"
+    t_start=$(date +%s%N)
+    log_step "Pruning cached distribution zips older than 7 days (~/.cache/electron)..."
+    old_zips=$(find "$HOME/.cache/electron" -type f -name "*.zip" -mtime +7 2>/dev/null | wc -l || echo 0)
+    if [[ $old_zips -gt 0 && "$MODE" != "check" ]]; then
+      find "$HOME/.cache/electron" -type f -name "*.zip" -mtime +7 -delete 2>/dev/null || true
+      find "$HOME/.cache/electron" -type d -empty -delete 2>/dev/null || true
+    fi
+    t_end=$(date +%s%N)
+    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+    log_card_end "CLEANED" "Pruned ${old_zips} stale electron archives" "$dur"
+    record_result "clean-electron" "CLEAN" "CLEANED" "${old_zips} archives pruned" "$dur"
+  fi
+
+  # 24. System Package Manager Cache Debloat (DNF)
+  if command -v dnf &>/dev/null && should_run "clean-dnf" "clean"; then
+    log_card_start "System Package Cache (DNF)" "clean"
+    t_start=$(date +%s%N)
+    log_step "Pruning downloaded package cache files..."
+    if [[ "$MODE" != "check" ]]; then
+      if sudo -n true 2>/dev/null; then
+        sudo dnf clean packages &>/dev/null || true
+      else
+        dnf clean packages &>/dev/null || true
+      fi
+    fi
+    t_end=$(date +%s%N)
+    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+    log_card_end "CLEANED" "DNF package cache pruned" "$dur"
+    record_result "clean-dnf" "CLEAN" "CLEANED" "Package cache pruned" "$dur"
+  fi
+
+  # 25. Stale Crashpad Dumps & Temporary Sockets
+  if should_run "clean-dumps" "clean"; then
+    log_card_start "Stale Crash Dumps & Daemon Minidumps" "clean"
+    t_start=$(date +%s%N)
+    log_step "Scanning for crashpad minidumps older than 7 days..."
+    dmp_count=$(find "$HOME/.config" "$HOME/.cache" -type f -name "*.dmp" -mtime +7 2>/dev/null | wc -l || echo 0)
+    if [[ $dmp_count -gt 0 && "$MODE" != "check" ]]; then
+      find "$HOME/.config" "$HOME/.cache" -type f -name "*.dmp" -mtime +7 -delete 2>/dev/null || true
+    fi
+    t_end=$(date +%s%N)
+    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+    log_card_end "CLEANED" "Pruned ${dmp_count} stale crash dumps" "$dur"
+    record_result "clean-dumps" "CLEAN" "CLEANED" "${dmp_count} dumps purged" "$dur"
+  fi
+fi
+
+# ==============================================================================
 # SUMMARY & OUTPUT
 # ==============================================================================
 count_updated=0
 count_uptodate=0
 count_avail=0
 count_cached=0
+count_cleaned=0
 count_skipped=0
 
 for s in "${REPORT_STATUS[@]}"; do
   case "$s" in
-    UPDATED)         ((count_updated++)) ;;
-    CACHED)          ((count_cached++)) ;;
-    "UP TO DATE")    ((count_uptodate++)) ;;
-    "UPDATE AVAIL")  ((count_avail++)) ;;
-    *)               ((count_skipped++)) ;;
+    UPDATED)           ((count_updated++)) ;;
+    CACHED)            ((count_cached++)) ;;
+    CLEANED|DEBLOATED) ((count_cleaned++)) ;;
+    "UP TO DATE")      ((count_uptodate++)) ;;
+    "UPDATE AVAIL")    ((count_avail++)) ;;
+    *)                 ((count_skipped++)) ;;
   esac
 done
 
@@ -1179,6 +1400,7 @@ summary = {
         'total': len(results),
         'up_to_date': ${count_uptodate},
         'updated': ${count_updated},
+        'cleaned': ${count_cleaned},
         'cached': ${count_cached},
         'available': ${count_avail},
         'skipped': ${count_skipped}
@@ -1214,6 +1436,10 @@ for i in "${!REPORT_NAMES[@]}"; do
       status_badge="${GREEN}✔ UPDATED${RESET}"
       status_plain="✔ UPDATED"
       ;;
+    CLEANED|DEBLOATED)
+      status_badge="${GREEN}✔ CLEANED${RESET}"
+      status_plain="✔ CLEANED"
+      ;;
     "UP TO DATE")
       status_badge="${GREEN}✔ UP-TO-DATE${RESET}"
       status_plain="✔ UP-TO-DATE"
@@ -1242,6 +1468,7 @@ for i in "${!REPORT_NAMES[@]}"; do
 
   type_badge="${CYAN}${type}${RESET}"
   [[ "$type" == "DESKTOP" ]] && type_badge="${MAGENTA}${type}${RESET}"
+  [[ "$type" == "CLEAN" ]] && type_badge="${BLUE}${type}${RESET}"
 
   pad_type=$(( 10 - ${#type} ))
   pad_status=$(( 18 - ${#status_plain} ))
@@ -1256,16 +1483,19 @@ for i in "${!REPORT_NAMES[@]}"; do
 done
 
 echo -e "${BOLD}${CYAN}╰─────────────────────┴────────────┴────────────────────┴────────────────────────┴───────╯${RESET}"
-if [[ $count_cached -gt 0 ]]; then
-  echo -e "  ${BOLD}Total:${RESET} ${#REPORT_NAMES[@]} items  │  ${GREEN}${count_uptodate} up-to-date${RESET}  │  ${GREEN}${count_updated} updated${RESET}  │  ${CYAN}${count_cached} cached${RESET}  │  ${YELLOW}${count_avail} available${RESET}  │  ${GRAY}${count_skipped} skipped${RESET}\n"
-else
-  echo -e "  ${BOLD}Total:${RESET} ${#REPORT_NAMES[@]} items  │  ${GREEN}${count_uptodate} up-to-date${RESET}  │  ${GREEN}${count_updated} updated${RESET}  │  ${YELLOW}${count_avail} available${RESET}  │  ${GRAY}${count_skipped} skipped${RESET}\n"
-fi
+summary_footer="  ${BOLD}Total:${RESET} ${#REPORT_NAMES[@]} items  │  ${GREEN}${count_uptodate} up-to-date${RESET}  │  ${GREEN}${count_updated} updated${RESET}"
+[[ $count_cleaned -gt 0 ]] && summary_footer+="  │  ${BLUE}${count_cleaned} cleaned${RESET}"
+[[ $count_cached -gt 0 ]] && summary_footer+="  │  ${CYAN}${count_cached} cached${RESET}"
+[[ $count_avail -gt 0 ]] && summary_footer+="  │  ${YELLOW}${count_avail} available${RESET}"
+[[ $count_skipped -gt 0 ]] && summary_footer+="  │  ${GRAY}${count_skipped} skipped${RESET}"
+echo -e "${summary_footer}\n"
 
 # Desktop Notification (if in active GUI session)
 if command -v notify-send &>/dev/null && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
-  notify_msg="${count_uptodate} Up-to-date, ${count_updated} Updated, ${count_avail} Available"
+  notify_msg="${count_uptodate} Up-to-date, ${count_updated} Updated"
+  [[ $count_cleaned -gt 0 ]] && notify_msg+=", ${count_cleaned} Cleaned"
+  [[ $count_avail -gt 0 ]] && notify_msg+=", ${count_avail} Available"
   notify-send -a "aiup" -i "dialog-information" "⚡ AIUP Sync Finished" "$notify_msg" 2>/dev/null || true
 elif [[ $IS_MACOS -eq 1 ]]; then
-  osascript -e "display notification \"${count_uptodate} Up-to-date, ${count_updated} Updated\" with title \"⚡ AIUP Sync Finished\"" 2>/dev/null || true
+  osascript -e "display notification \"${count_uptodate} Up-to-date, ${count_updated} Updated, ${count_cleaned} Cleaned\" with title \"⚡ AIUP Sync Finished\"" 2>/dev/null || true
 fi

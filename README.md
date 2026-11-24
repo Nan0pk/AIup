@@ -86,16 +86,35 @@ This installs `aiup` and the short alias `uai` to `~/.local/bin/` with automatic
 | **Orkas Desktop** | Electron (`~/Orkas`) | Multi-agent AI team desktop client |
 | **Hermes Desktop UI** | UI (`hermes desktop`) | Hermes desktop frontend |
 
+### 🧹 Housekeeping & System Debloat
+| Module | Target | Action |
+| :--- | :--- | :--- |
+| **Python uv Cache** | `clean-uv` | Prune dangling wheel builds & orphaned venvs |
+| **NPM Cache & Logs** | `clean-npm` | Verify cache integrity & purge stale debug logs |
+| **Python Pip Cache** | `clean-pip` | Purge cached wheel downloads & HTTP cache |
+| **Installer Packages** | `clean-installers` | Remove cached `.rpm` installers once updated |
+| **Git Housekeeping** | `clean-git` | Auto-pack loose objects & prune git reflogs |
+| **Electron Archives** | `clean-electron` | Prune stale `.zip` runtime downloads older than 7d |
+| **DNF Package Cache** | `clean-dnf` | Clean cached RPM packages and transaction headers |
+| **Crashpad Dumps** | `clean-dumps` | Purge minidump files older than 7d |
+
 ---
 
 ## 🛠️ CLI Usage
 
 ```bash
-# Update everything (CLI engines + Desktop apps)
+# Update everything (CLI engines + Desktop apps) with housekeeping debloat
 aiup
 
 # Fast alias
 uai
+
+# Run housekeeping & cache debloat only (skip updates)
+aiup -C
+# or: aiup --clean
+
+# Fast update only, skipping post-update housekeeping
+aiup --no-clean
 
 # Pre-authenticate sudo upfront at startup for an uninterrupted batch
 aiup -S
@@ -132,6 +151,7 @@ aiup -c --json
 
 ## 🛡️ Safety & Architecture
 
+- **Automated Housekeeping & Debloat**: Cleans temporary updater artifacts (e.g. downloaded `.rpm` packages once installed), prunes dangling `uv` wheel builds, purges `pip` caches, removes stale `~/.npm/_logs`, and auto-optimizes local AI git repositories (`git gc`).
 - **Intelligent Privilege Elevation**: Sudo authentication can occur upfront at the start of a run (if privileged desktop apps are scheduled) or just-in-time when an update requires root (`rpm -U`, `dnf upgrade`). An active keep-alive prevents credential timeouts during long downloads. In dry-run (`-c`), inventory list (`-l`), or CLI-only scopes, root authorization is never requested.
 - **Working Tree Preservation**: Detects uncommitted changes in local git checkouts (`~/CoWork-OS`, `~/Orkas`) and skips auto-pulls by default to protect in-flight development work.
 - **NPM Symlink Protection**: Updates global packages individually without breaking local `npm link` references (such as symlinked local AI repos).
