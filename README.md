@@ -56,10 +56,10 @@ From a local clone:
 ./install.sh
 ```
 
-Or remotely once published to GitHub:
+Or install remotely from GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Nan0pk/aiup/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Nan0pk/AIup/main/install.sh | bash
 ```
 
 Installs `aiup` and `uai` into `~/.local/bin/` along with Bash and Zsh autocompletion.

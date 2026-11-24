@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # aiup Installer
-# Repository: https://github.com/Nan0pk/aiup
+# Repository: https://github.com/Nan0pk/AIup
 # Usage:
 #   ./install.sh
-#   curl -fsSL https://raw.githubusercontent.com/Nan0pk/aiup/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Nan0pk/AIup/main/install.sh | bash
 # ==============================================================================
 
 set -euo pipefail
 
-REPO_RAW_URL="https://raw.githubusercontent.com/Nan0pk/aiup/main"
+REPO_RAW_URL="https://raw.githubusercontent.com/Nan0pk/AIup/main"
 INSTALL_DIR="${HOME}/.local/bin"
 BASH_COMP_DIR="${HOME}/.local/share/bash-completion/completions"
 ZSH_COMP_DIR="${HOME}/.local/share/zsh/site-functions"

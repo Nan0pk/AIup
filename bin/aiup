@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # aiup - The Universal AI Harness & Desktop App Updater
-# Repository: https://github.com/Nan0pk/aiup
+# Repository: https://github.com/Nan0pk/AIup
 # License: MIT
 # ==============================================================================
 
@@ -102,7 +102,7 @@ trap cleanup_on_exit EXIT
 usage() {
   echo -e "${BOLD}${CYAN}╭──────────────────────────────────────────────────────────────╮${RESET}"
   echo -e "${BOLD}${CYAN}│${RESET}  ${BOLD}⚡ AIUP${RESET} — Universal AI Harness & Desktop App Updater     ${BOLD}${CYAN}│${RESET}"
-  echo -e "${BOLD}${CYAN}│${RESET}  ${DIM}Version ${VERSION}  •  https://github.com/Nan0pk/aiup${RESET}           ${BOLD}${CYAN}│${RESET}"
+  echo -e "${BOLD}${CYAN}│${RESET}  ${DIM}Version ${VERSION}  •  https://github.com/Nan0pk/AIup${RESET}           ${BOLD}${CYAN}│${RESET}"
   echo -e "${BOLD}${CYAN}╰──────────────────────────────────────────────────────────────╯${RESET}"
   echo ""
   echo -e "${BOLD}USAGE:${RESET}"
