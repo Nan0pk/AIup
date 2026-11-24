@@ -3,43 +3,22 @@
 # aiup - The Universal AI Harness & Desktop App Updater
 # Repository: https://github.com/Nan0pk/aiup
 # License: MIT
-#
-# Supported Categories:
-#   ◈ CLI Harnesses & Agents:
-#     - agy                  (Google Antigravity CLI)
-#     - claude               (Anthropic Claude Code CLI)
-#     - codex                (OpenAI Codex CLI)
-#     - hermes               (NousResearch Hermes Agent)
-#     - opencode             (OpenCode CLI)
-#     - mimo                 (Xiaomi Mimocode CLI)
-#     - kilo                 (Kilo Agent / CLI)
-#     - goose                (Block Goose CLI)
-#     - uv-tools             (Python uv managed tools, e.g. mistral-vibe)
-#     - npm-globals          (command-code, @qwen-code/qwen-code, cline)
-#
-#   ❖ Desktop AI Apps & Workspaces:
-#     - chatgpt              (ChatGPT Desktop App - DNF / APT / DMG / RPM)
-#     - opencode-desktop     (OpenCode Desktop App - RPM / AppImage / DMG)
-#     - aionui               (AionUi AI Workspace Desktop)
-#     - antigravity-desktop  (Google Antigravity IDE)
-#     - cowork-os            (CoWork-OS Desktop & Local Repository)
-#     - orkas                (Orkas Desktop Multi-Agent Client)
-#     - hermes-desktop       (Hermes Desktop UI)
 # ==============================================================================
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
-# Detect Operating System
+# Detect Operating System & Architecture
 OS="$(uname -s)"
+ARCH="$(uname -m)"
 case "$OS" in
   Linux*)  IS_LINUX=1; IS_MACOS=0 ;;
   Darwin*) IS_LINUX=0; IS_MACOS=1 ;;
   *)       IS_LINUX=0; IS_MACOS=0 ;;
 esac
 
-# Detect Linux Package Manager
+# Detect Package Manager
 PKG_MGR="unknown"
 if [[ $IS_LINUX -eq 1 ]]; then
   if command -v dnf &>/dev/null; then
@@ -55,8 +34,19 @@ elif [[ $IS_MACOS -eq 1 ]]; then
   PKG_MGR="brew"
 fi
 
-# ANSI Styling
-if [[ -t 1 && "${NO_COLOR:-}" != "1" && "${1:-}" != *"--no-color"* ]]; then
+# Determine color support early across ALL arguments
+USE_COLOR=1
+if [[ ! -t 1 || "${NO_COLOR:-}" == "1" || "${TERM:-}" == "dumb" ]]; then
+  USE_COLOR=0
+fi
+for _arg in "$@"; do
+  if [[ "$_arg" == "--no-color" || "$_arg" == "--json" ]]; then
+    USE_COLOR=0
+    break
+  fi
+done
+
+if [[ $USE_COLOR -eq 1 ]]; then
   BOLD="\033[1m"
   DIM="\033[2m"
   RED="\033[1;31m"
@@ -82,23 +72,32 @@ else
   RESET=""
 fi
 
-# Track results
+# Execution state
 declare -a REPORT_NAMES=()
 declare -a REPORT_TYPES=()
 declare -a REPORT_STATUS=()
 declare -a REPORT_DETAILS=()
 declare -a REPORT_DURATIONS=()
 
-MODE="update"     # "update", "check", "list", "clean"
-FILTER_TYPE="all" # "all", "cli", "desktop", "clean"
+DRY_RUN=0          # 1 for -c/--check
+LIST_ONLY=0        # 1 for -l/--list
+FILTER_TYPE="all"  # "all", "cli", "desktop", "clean"
 OUTPUT_FORMAT="text" # "text", "json"
 FORCE_GIT=0
-FORCE_PREAUTH=0
+FORCE_PREAUTH=0    # 1 for -S/--sudo
 NO_SUDO=0
 DO_CLEANUP=1
+NPM_DID_UPDATE=0
 SUDO_KEEP_ALIVE_PID=""
 declare -a ONLY_TARGETS=()
 declare -a SKIP_TARGETS=()
+
+cleanup_on_exit() {
+  if [[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]]; then
+    kill "$SUDO_KEEP_ALIVE_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_on_exit EXIT
 
 usage() {
   echo -e "${BOLD}${CYAN}╭──────────────────────────────────────────────────────────────╮${RESET}"
@@ -113,18 +112,18 @@ usage() {
   echo -e "${BOLD}OPTIONS:${RESET}"
   echo -e "    ${CYAN}-h, --help${RESET}            Show this documentation"
   echo -e "    ${CYAN}-v, --version${RESET}         Show version number"
-  echo -e "    ${CYAN}-l, --list${RESET}            List all detected CLI and Desktop AI apps & versions"
-  echo -e "    ${CYAN}-c, --check${RESET}           Dry-run check for available updates without applying"
-  echo -e "    ${CYAN}-C, --clean${RESET}           Perform housekeeping, cache purge & system debloat only"
+  echo -e "    ${CYAN}-l, --list${RESET}            List detected CLI and Desktop AI apps & versions"
+  echo -e "    ${CYAN}-c, --check${RESET}           Non-mutating check for available updates/debloat"
+  echo -e "    ${CYAN}-C, --clean${RESET}           Run housekeeping, cache purge & debloat scope only"
   echo -e "    ${CYAN}--no-clean${RESET}            Skip post-update housekeeping and cache debloat"
-  echo -e "    ${CYAN}-S, --sudo${RESET}            Pre-authenticate sudo upfront at startup for unattended sync"
-  echo -e "    ${CYAN}--no-sudo${RESET}             Disable all sudo prompts (skip or cache privileged updates)"
+  echo -e "    ${CYAN}-S, --sudo${RESET}            Pre-authenticate sudo at startup (if safe) for unattended sync"
+  echo -e "    ${CYAN}--no-sudo${RESET}             Disable sudo/pkexec prompts (cache privileged updates)"
   echo -e "    ${CYAN}--cli${RESET}                 Only target CLI harnesses and agent runtimes"
   echo -e "    ${CYAN}--desktop${RESET}             Only target Desktop AI apps and UI workspaces"
-  echo -e "    ${CYAN}-o, --only <names>${RESET}    Only update specified targets (comma-separated)"
+  echo -e "    ${CYAN}-o, --only <names>${RESET}    Only run specified targets (comma-separated)"
   echo -e "    ${CYAN}-s, --skip <names>${RESET}    Skip specified targets (comma-separated)"
   echo -e "    ${CYAN}--json${RESET}                Output results in JSON format"
-  echo -e "    ${CYAN}--force-git${RESET}           Stash and update git repos even if tree is dirty"
+  echo -e "    ${CYAN}--force-git${RESET}           Stash, pull, and restore dirty git checkouts"
   echo -e "    ${CYAN}--no-color${RESET}            Disable colored terminal output"
   echo ""
   echo -e "${BOLD}SUPPORTED TARGETS:${RESET}"
@@ -134,15 +133,24 @@ usage() {
   echo ""
   echo -e "${BOLD}EXAMPLES:${RESET}"
   echo "    aiup                    # Update everything with live progress & debloat afterwards"
-  echo "    aiup -l                 # Sleek dashboard of all installed versions"
-  echo "    aiup -c                 # Check update availability without touching files"
-  echo "    aiup -C                 # Run cache debloat & housekeeping only (skip updates)"
-  echo "    aiup -S                 # Pre-authenticate sudo at start for uninterrupted batch"
-  echo "    aiup --no-clean         # Fast update only, skipping housekeeping"
-  echo "    aiup --desktop          # Update only desktop AI applications"
-  echo "    aiup -o chatgpt,claude  # Target specific apps"
-  echo "    aiup -c --json          # Output results as JSON for automations"
+  echo "    aiup -l                 # Visual dashboard of detected installed versions"
+  echo "    aiup -c                 # Safe dry-run check without modifying files"
+  echo "    aiup -C                 # Run housekeeping & cache debloat only"
+  echo "    aiup -c -C              # Dry-run housekeeping check (shows reclaimable cache)"
+  echo "    aiup -S                 # Pre-authenticate sudo upfront if safe"
+  echo "    aiup --no-clean         # Update only, skip housekeeping"
+  echo "    aiup -o opencode,claude # Target specific apps"
+  echo "    aiup -l --json          # Structured JSON inventory for automations"
   exit 0
+}
+
+require_arg_value() {
+  local opt="$1"
+  local val="${2:-}"
+  if [[ -z "$val" || "$val" == -* ]]; then
+    echo -e "${RED}[ERROR]${RESET} Option ${opt} requires a non-empty value." >&2
+    exit 2
+  fi
 }
 
 # Parse Arguments
@@ -152,19 +160,18 @@ while [[ $# -gt 0 ]]; do
       usage
       ;;
     -v|--version)
-      echo "aiup version ${VERSION} (${OS})"
+      echo "aiup version ${VERSION} (${OS} ${ARCH})"
       exit 0
       ;;
     -l|--list)
-      MODE="list"
+      LIST_ONLY=1
       shift
       ;;
     -c|--check)
-      MODE="check"
+      DRY_RUN=1
       shift
       ;;
     -C|--clean|--debloat)
-      MODE="clean"
       FILTER_TYPE="clean"
       DO_CLEANUP=1
       shift
@@ -198,21 +205,23 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --no-color)
-      BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; MAGENTA=""
-      GRAY=""; LIGHT_GRAY=""; RESET=""
       shift
       ;;
     -o|--only)
+      require_arg_value "$1" "${2:-}"
       IFS=',' read -r -a targets <<< "$2"
       for t in "${targets[@]}"; do
-        ONLY_TARGETS+=("$(echo "$t" | tr '[:upper:]' '[:lower:]' | xargs)")
+        t_clean="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -n "$t_clean" ]] && ONLY_TARGETS+=("$t_clean")
       done
       shift 2
       ;;
     -s|--skip)
+      require_arg_value "$1" "${2:-}"
       IFS=',' read -r -a targets <<< "$2"
       for t in "${targets[@]}"; do
-        SKIP_TARGETS+=("$(echo "$t" | tr '[:upper:]' '[:lower:]' | xargs)")
+        t_clean="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -n "$t_clean" ]] && SKIP_TARGETS+=("$t_clean")
       done
       shift 2
       ;;
@@ -223,11 +232,25 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Derive normalized mode label for UI/JSON
+if [[ $LIST_ONLY -eq 1 ]]; then
+  MODE_LABEL="list"
+elif [[ $DRY_RUN -eq 1 ]]; then
+  MODE_LABEL="check"
+elif [[ "$FILTER_TYPE" == "clean" ]]; then
+  MODE_LABEL="clean"
+else
+  MODE_LABEL="update"
+fi
+
+# ==============================================================================
+# HELPERS & UTILITIES
+# ==============================================================================
 should_run() {
   local name="$1"
   local type="$2" # "cli", "desktop", or "clean"
   local lower_name
-  lower_name="$(echo "$name" | tr '[:upper:]' '[:lower:]')"
+  lower_name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
 
   if [[ "$FILTER_TYPE" == "cli" && "$type" != "cli" ]]; then
     return 1
@@ -243,21 +266,24 @@ should_run() {
   fi
 
   for s in "${SKIP_TARGETS[@]:-}"; do
-    if [[ "$lower_name" == "$s" ]]; then
-      return 1
-    fi
+    [[ -n "$s" && "$lower_name" == "$s" ]] && return 1
   done
 
   if [[ ${#ONLY_TARGETS[@]} -gt 0 ]]; then
     for o in "${ONLY_TARGETS[@]}"; do
-      if [[ "$lower_name" == "$o" ]]; then
-        return 0
-      fi
+      [[ -n "$o" && "$lower_name" == "$o" ]] && return 0
     done
     return 1
   fi
 
   return 0
+}
+
+elapsed_since() {
+  local t_start="$1"
+  local t_end
+  t_end=$(date +%s%N)
+  awk -v s="$t_start" -v e="$t_end" 'BEGIN {printf "%.1fs", (e - s)/1000000000}'
 }
 
 record_result() {
@@ -280,7 +306,7 @@ log_card_start() {
   local type="$2"
   if [[ "$type" == "cli" ]]; then
     echo -e "${BOLD}${CYAN}┌── ◈ [CLI] ${title}${RESET}"
-  elif [[ "$type" == "clean" || "$type" == "clean"* ]]; then
+  elif [[ "$type" == "clean" ]]; then
     echo -e "${BOLD}${BLUE}┌── 🧹 [CLEANUP] ${title}${RESET}"
   else
     echo -e "${BOLD}${MAGENTA}┌── ❖ [DESKTOP] ${title}${RESET}"
@@ -301,54 +327,72 @@ log_card_end() {
   local badge=""
 
   case "$status" in
-    UPDATED)
-      badge="${GREEN}✔ [UPDATED]${RESET}"
-      ;;
-    CLEANED|DEBLOATED)
-      badge="${GREEN}✔ [CLEANED]${RESET}"
-      ;;
-    "UP TO DATE")
-      badge="${GREEN}✔ [UP-TO-DATE]${RESET}"
-      ;;
-    "UPDATE AVAIL")
-      badge="${YELLOW}★ [UPDATE AVAILABLE]${RESET}"
-      ;;
-    "DIRTY (SKIPPED)")
-      badge="${YELLOW}▲ [DIRTY TREE]${RESET}"
-      ;;
-    CACHED)
-      badge="${CYAN}⇣ [CACHED]${RESET}"
-      ;;
-    SKIPPED)
-      badge="${GRAY}⊘ [SKIPPED]${RESET}"
-      ;;
-    *)
-      badge="${CYAN}• [${status}]${RESET}"
-      ;;
+    UPDATED)           badge="${GREEN}✔ [UPDATED]${RESET}" ;;
+    CLEANED|DEBLOATED) badge="${GREEN}✔ [CLEANED]${RESET}" ;;
+    "UP TO DATE")      badge="${GREEN}✔ [UP-TO-DATE]${RESET}" ;;
+    "UPDATE AVAIL")    badge="${YELLOW}★ [UPDATE AVAILABLE]${RESET}" ;;
+    "DIRTY (SKIPPED)") badge="${YELLOW}▲ [DIRTY TREE]${RESET}" ;;
+    CACHED)            badge="${CYAN}⇣ [CACHED]${RESET}" ;;
+    SKIPPED)           badge="${GRAY}⊘ [SKIPPED]${RESET}" ;;
+    FAILED)            badge="${RED}✖ [FAILED]${RESET}" ;;
+    *)                 badge="${CYAN}• [${status}]${RESET}" ;;
   esac
 
   echo -e "  ${DIM}└──${RESET} ${badge} ${detail} ${GRAY}[${dur}]${RESET}\n"
 }
 
+# Drains stdin completely so upstream never receives SIGPIPE under pipefail
 stream_progress() {
-  [[ "$OUTPUT_FORMAT" == "json" ]] && cat >/dev/null && return
   local max_lines="${1:-6}"
   local count=0
+  local esc_strip=$'s/\x1B\\[[0-9;]*[a-zA-Z]//g'
   while IFS= read -r line; do
-    line=$(echo "$line" | tr -d '\r' | sed -E "s/\x1B\[[0-9;]*[a-zA-Z]//g" | xargs 2>/dev/null)
+    if [[ "$OUTPUT_FORMAT" == "json" ]] || [[ $count -ge $max_lines ]]; then
+      continue
+    fi
+    line="$(printf '%s' "$line" | tr '\r' '\n' | tail -n 1 | sed -E "$esc_strip" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ -z "$line" ]] && continue
-    if [[ "$line" =~ ^[[:space:]]*[═─━_=-]{3,} ]] || [[ "$line" =~ ^[█░▒◒◐◓◑]+$ ]]; then
+    if [[ "$line" =~ ^[═─━_=-]{3,}$ ]] || [[ "$line" =~ ^[█░▒◒◐◓◑]+$ ]]; then
       continue
     fi
     if [[ ${#line} -gt 74 ]]; then
       line="${line:0:71}..."
     fi
     echo -e "  ${DIM}│${RESET}   ${GRAY}↳${RESET} ${DIM}${line}${RESET}"
-    ((count++))
-    if [[ $count -ge $max_lines ]]; then
-      break
-    fi
+    ((count++)) || true
   done
+}
+
+is_version_gt() {
+  local candidate="$1"
+  local current="$2"
+  python3 -c '
+import re, sys
+
+def norm(s):
+    s = s.strip().lstrip("vV")
+    main, _, pre = s.partition("-")
+    parts = [int(x) for x in re.findall(r"\d+", main)]
+    # Stable release > prerelease for same base tuple
+    return (parts, 0 if pre else 1, pre)
+
+c, l = norm(sys.argv[1]), norm(sys.argv[2])
+sys.exit(0 if c > l else 1)
+' "$candidate" "$current" 2>/dev/null
+}
+
+verify_sha512_b64() {
+  local file_path="$1"
+  local expected_b64="$2"
+  python3 -c '
+import base64, hashlib, sys
+h = hashlib.sha512()
+with open(sys.argv[1], "rb") as f:
+    for chunk in iter(lambda: f.read(1048576), b""):
+        h.update(chunk)
+actual = base64.b64encode(h.digest()).decode("ascii")
+sys.exit(0 if actual == sys.argv[2].strip() else 1)
+' "$file_path" "$expected_b64" 2>/dev/null
 }
 
 keep_sudo_alive() {
@@ -358,7 +402,6 @@ keep_sudo_alive() {
       sleep 50
     done 2>/dev/null &
     SUDO_KEEP_ALIVE_PID=$!
-    trap '[[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]] && kill "$SUDO_KEEP_ALIVE_PID" 2>/dev/null || true' EXIT
   fi
 }
 
@@ -366,19 +409,16 @@ run_privileged() {
   local prompt_desc="${1:-system update}"
   shift || true
 
-  # 1. Non-interactive or already authenticated sudo session
   if sudo -n true 2>/dev/null; then
     keep_sudo_alive
     sudo "$@"
     return $?
   fi
 
-  # Skip interactive prompts if explicitly marked non-interactive or --no-sudo
   if [[ $NO_SUDO -eq 1 || "${CI:-}" == "true" || "${DEBIAN_FRONTEND:-}" == "noninteractive" || "${AIUP_NONINTERACTIVE:-}" == "1" ]]; then
     return 2
   fi
 
-  # 2. Interactive terminal (stdin is a TTY)
   if [[ -t 0 ]]; then
     log_step "Administrator privileges required for ${prompt_desc}"
     if sudo -v </dev/tty >/dev/tty 2>&1; then
@@ -389,7 +429,6 @@ run_privileged() {
     return 1
   fi
 
-  # 3. Graphical desktop session with Polkit pkexec
   if [[ (-n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}") ]] && command -v pkexec &>/dev/null; then
     log_step "Requesting desktop authorization via pkexec (${prompt_desc})..."
     pkexec "$@"
@@ -400,57 +439,29 @@ run_privileged() {
 }
 
 preauth_sudo_if_safe() {
-  # Never in check or list mode
-  [[ "$MODE" != "update" ]] && return 0
-
-  # Never if user explicitly disabled sudo
-  [[ $NO_SUDO -eq 1 ]] && return 0
-
-  # Never in automated/CI runs unless forced
-  if [[ $FORCE_PREAUTH -eq 0 ]]; then
-    [[ "${CI:-}" == "true" || "${DEBIAN_FRONTEND:-}" == "noninteractive" || "${AIUP_NONINTERACTIVE:-}" == "1" ]] && return 0
-  fi
-
-  # Only if running interactively in a terminal
+  # Pre-authenticate at startup ONLY when -S/--sudo is passed and it is safe
+  [[ $FORCE_PREAUTH -eq 0 ]] && return 0
+  [[ $DRY_RUN -eq 1 || $LIST_ONLY -eq 1 || $NO_SUDO -eq 1 ]] && return 0
+  [[ "$FILTER_TYPE" == "cli" || "$FILTER_TYPE" == "clean" ]] && return 0
+  [[ "${CI:-}" == "true" || "${DEBIAN_FRONTEND:-}" == "noninteractive" || "${AIUP_NONINTERACTIVE:-}" == "1" ]] && return 0
   [[ ! -t 0 ]] && return 0
 
-  # Check if privileged targets are included in this run
-  local has_privileged=0
-  if (rpm -q chatgpt &>/dev/null || [[ -d "/Applications/ChatGPT.app" ]]) && should_run "chatgpt" "desktop"; then
-    has_privileged=1
-  fi
-  if (rpm -q opencode &>/dev/null || [[ -d "/opt/OpenCode" ]]) && should_run "opencode-desktop" "desktop"; then
-    has_privileged=1
-  fi
-
-  # If not forced with -S/--sudo, only pre-auth if privileged apps are queued
-  if [[ $FORCE_PREAUTH -eq 0 && $has_privileged -eq 0 ]]; then
-    return 0
-  fi
-
-  # If sudo is already cached/active, keep it warm and return
   if sudo -n true 2>/dev/null; then
     keep_sudo_alive
     return 0
   fi
 
-  # Safe interactive startup pre-auth
   if [[ "$OUTPUT_FORMAT" != "json" ]]; then
     echo -e "${DIM}┌──${RESET} ${BOLD}${CYAN}🔒 Administrator Privileges (sudo)${RESET}"
-    echo -e "  ${DIM}│${RESET}   ${GRAY}↳${RESET} ${LIGHT_GRAY}Privileged system targets included in sync${RESET}"
-    echo -e "  ${DIM}│${RESET}   ${GRAY}↳${RESET} ${LIGHT_GRAY}Authenticating upfront for seamless unattended run...${RESET}"
+    echo -e "  ${DIM}│${RESET}   ${GRAY}↳${RESET} ${LIGHT_GRAY}Pre-authenticating upfront (-S/--sudo) for unattended batch sync...${RESET}"
   fi
 
   if sudo -v </dev/tty >/dev/tty 2>&1; then
     keep_sudo_alive
-    if [[ "$OUTPUT_FORMAT" != "json" ]]; then
-      echo -e "  ${DIM}└──${RESET} ${GREEN}✔ Sudo session established (active keep-alive)${RESET}\n"
-    fi
+    [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "  ${DIM}└──${RESET} ${GREEN}✔ Sudo session established (active keep-alive)${RESET}\n"
     return 0
   else
-    if [[ "$OUTPUT_FORMAT" != "json" ]]; then
-      echo -e "  ${DIM}└──${RESET} ${YELLOW}⚠ Sudo pre-auth skipped — will request when needed${RESET}\n"
-    fi
+    [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "  ${DIM}└──${RESET} ${YELLOW}⚠ Sudo pre-auth skipped — will prompt only if needed${RESET}\n"
     return 1
   fi
 }
@@ -461,38 +472,46 @@ get_asar_version() {
     echo "unknown"
     return
   fi
-  python3 -c "
+  python3 -c '
 import struct, json, sys
 try:
-    with open(sys.argv[1], 'rb') as f:
+    with open(sys.argv[1], "rb") as f:
         f.seek(4)
-        total_header_size = struct.unpack('<I', f.read(4))[0]
+        total_header_size = struct.unpack("<I", f.read(4))[0]
         base = 8 + total_header_size
         f.seek(12)
-        l = struct.unpack('<I', f.read(4))[0]
-        h = json.loads(f.read(l).decode('utf-8'))
-        off = int(h['files']['package.json']['offset'])
-        sz = int(h['files']['package.json']['size'])
+        l = struct.unpack("<I", f.read(4))[0]
+        h = json.loads(f.read(l).decode("utf-8"))
+        off = int(h["files"]["package.json"]["offset"])
+        sz = int(h["files"]["package.json"]["size"])
         f.seek(base + off)
-        p = json.loads(f.read(sz).decode('utf-8'))
-        print(p.get('version', 'unknown'))
+        p = json.loads(f.read(sz).decode("utf-8"))
+        print(p.get("version", "unknown"))
 except Exception:
-    print('unknown')
-" "$asar_path" 2>/dev/null || echo "unknown"
+    print("unknown")
+' "$asar_path" 2>/dev/null || echo "unknown"
 }
 
-get_npm_pkg_version() {
-  local pkg="$1"
+get_npm_root_global() {
   local node_root="${HOME}/.local/node/lib/node_modules"
   if [[ ! -d "$node_root" ]] && command -v npm &>/dev/null; then
     node_root="$(npm root -g 2>/dev/null || echo '')"
   fi
-  if [[ -f "${node_root}/${pkg}/package.json" ]]; then
+  echo "$node_root"
+}
+
+get_npm_pkg_version() {
+  local pkg="$1"
+  local node_root
+  node_root="$(get_npm_root_global)"
+  if [[ -n "$node_root" && -f "${node_root}/${pkg}/package.json" ]] && command -v jq &>/dev/null; then
     jq -r '.version // "unknown"' "${node_root}/${pkg}/package.json" 2>/dev/null
   else
     echo ""
   fi
 }
+
+TRACKED_NPM_PKGS=("command-code" "@qwen-code/qwen-code" "cline")
 
 get_version() {
   local tool="$1"
@@ -501,7 +520,7 @@ get_version() {
       command -v agy &>/dev/null && agy --version 2>&1 | head -n 1 | awk '{print $1}' || echo "not installed"
       ;;
     claude)
-      command -v claude &>/dev/null && claude --version 2>&1 | head -n 1 || echo "not installed"
+      command -v claude &>/dev/null && claude --version 2>&1 | head -n 1 | awk '{print $1}' || echo "not installed"
       ;;
     codex)
       command -v codex &>/dev/null && codex --version 2>&1 | head -n 1 | awk '{print $2}' || echo "not installed"
@@ -519,7 +538,7 @@ get_version() {
       command -v kilo &>/dev/null && kilo --version 2>&1 | head -n 1 || echo "not installed"
       ;;
     goose)
-      command -v goose &>/dev/null && goose --version 2>&1 | head -n 1 | xargs || echo "not installed"
+      command -v goose &>/dev/null && goose --version 2>&1 | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "not installed"
       ;;
     chatgpt)
       if command -v rpm &>/dev/null && rpm -q chatgpt &>/dev/null; then
@@ -533,6 +552,8 @@ get_version() {
     opencode-desktop)
       if command -v rpm &>/dev/null && rpm -q opencode &>/dev/null; then
         rpm -q --qf '%{VERSION}\n' opencode 2>/dev/null
+      elif [[ -d "/opt/OpenCode" ]]; then
+        echo "unmanaged"
       else
         echo "not installed"
       fi
@@ -545,9 +566,8 @@ get_version() {
       ;;
     cowork-os)
       if [[ -d "$HOME/CoWork-OS/.git" ]]; then
-        local hash
+        local hash pkg_ver
         hash=$(git -C "$HOME/CoWork-OS" rev-parse --short HEAD 2>/dev/null || echo "git")
-        local pkg_ver
         pkg_ver=$(jq -r '.version // "unknown"' "$HOME/CoWork-OS/package.json" 2>/dev/null || echo "dev")
         echo "v${pkg_ver} (${hash})"
       else
@@ -556,9 +576,8 @@ get_version() {
       ;;
     orkas)
       if [[ -d "$HOME/Orkas/.git" ]]; then
-        local hash
+        local hash pkg_ver
         hash=$(git -C "$HOME/Orkas" rev-parse --short HEAD 2>/dev/null || echo "git")
-        local pkg_ver
         pkg_ver=$(jq -r '.version // "unknown"' "$HOME/Orkas/package.json" 2>/dev/null || echo "dev")
         echo "v${pkg_ver} (${hash})"
       else
@@ -566,21 +585,30 @@ get_version() {
       fi
       ;;
     hermes-desktop)
-      command -v hermes &>/dev/null && echo "Ready" || echo "not installed"
+      command -v hermes &>/dev/null && echo "Available" || echo "not installed"
       ;;
     uv-tools)
-      command -v uv &>/dev/null && (uv tool list 2>/dev/null | tr '\n' ', ' | sed 's/,$//') || echo "none"
+      if command -v uv &>/dev/null; then
+        local uv_pkgs
+        uv_pkgs=$(uv tool list 2>/dev/null | grep -E '^[a-zA-Z0-9._-]+\s+v?[0-9]' | awk '{printf "%s@%s ", $1, $2}' | sed 's/ $//')
+        echo "${uv_pkgs:-none}"
+      else
+        echo "not installed"
+      fi
       ;;
     npm-globals)
-      local items=""
-      for p in "command-code" "@qwen-code/qwen-code" "cline"; do
-        local v
-        v=$(get_npm_pkg_version "$p")
-        if [[ -n "$v" ]]; then
-          items+="${p##*/}@${v} "
-        fi
-      done
-      echo "${items:-none}"
+      if command -v npm &>/dev/null; then
+        local items=""
+        for p in "${TRACKED_NPM_PKGS[@]}"; do
+          local v
+          v=$(get_npm_pkg_version "$p")
+          [[ -n "$v" ]] && items+="${p##*/}@${v} "
+        done
+        echo "${items% }"
+        [[ -z "$items" ]] && true
+      else
+        echo "not installed"
+      fi
       ;;
     *)
       echo "unknown"
@@ -589,37 +617,65 @@ get_version() {
 }
 
 list_harnesses() {
+  local v_agy v_claude v_codex v_hermes v_opencode v_mimo v_kilo v_goose v_uv v_npm
+  local v_chatgpt v_opencode_desk v_aionui v_ag_desk v_cowork v_orkas v_hermes_desk
+  v_agy="$(get_version agy)"
+  v_claude="$(get_version claude)"
+  v_codex="$(get_version codex)"
+  v_hermes="$(get_version hermes)"
+  v_opencode="$(get_version opencode)"
+  v_mimo="$(get_version mimo)"
+  v_kilo="$(get_version kilo)"
+  v_goose="$(get_version goose)"
+  v_uv="$(get_version uv-tools)"
+  v_npm="$(get_version npm-globals)"
+  [[ -z "$v_npm" ]] && v_npm="none"
+
+  v_chatgpt="$(get_version chatgpt)"
+  v_opencode_desk="$(get_version opencode-desktop)"
+  v_aionui="$(get_version aionui)"
+  v_ag_desk="$(get_version antigravity-desktop)"
+  v_cowork="$(get_version cowork-os)"
+  v_orkas="$(get_version orkas)"
+  v_hermes_desk="$(get_version hermes-desktop)"
+
   if [[ "$OUTPUT_FORMAT" == "json" ]]; then
-    python3 -c "
-import json
+    python3 -c '
+import json, sys
+keys_cli = ["agy", "claude", "codex", "hermes", "opencode", "mimo", "kilo", "goose", "uv_tools", "npm_globals"]
+keys_desk = ["chatgpt", "opencode_desktop", "aionui", "antigravity_desktop", "cowork_os", "orkas", "hermes_desktop"]
 data = {
-  'os': '${OS}',
-  'pkg_manager': '${PKG_MGR}',
-  'cli_harnesses': {
-    'agy': '$(get_version agy)',
-    'claude': '$(get_version claude)',
-    'codex': '$(get_version codex)',
-    'hermes': '$(get_version hermes)',
-    'opencode': '$(get_version opencode)',
-    'mimo': '$(get_version mimo)',
-    'kilo': '$(get_version kilo)',
-    'goose': '$(get_version goose)',
-    'uv_tools': '$(get_version uv-tools)',
-    'npm_globals': '$(get_version npm-globals)'
-  },
-  'desktop_apps': {
-    'chatgpt': '$(get_version chatgpt)',
-    'opencode_desktop': '$(get_version opencode-desktop)',
-    'aionui': '$(get_version aionui)',
-    'antigravity_desktop': '$(get_version antigravity-desktop)',
-    'cowork_os': '$(get_version cowork-os)',
-    'orkas': '$(get_version orkas)',
-    'hermes_desktop': '$(get_version hermes-desktop)'
-  }
+    "version": sys.argv[1],
+    "os": sys.argv[2],
+    "arch": sys.argv[3],
+    "pkg_manager": sys.argv[4],
+    "cli_harnesses": dict(zip(keys_cli, sys.argv[5:15])),
+    "desktop_apps": dict(zip(keys_desk, sys.argv[15:22])),
 }
 print(json.dumps(data, indent=2))
-"
+' \
+      "$VERSION" "$OS" "$ARCH" "$PKG_MGR" \
+      "$v_agy" "$v_claude" "$v_codex" "$v_hermes" "$v_opencode" "$v_mimo" "$v_kilo" "$v_goose" "$v_uv" "$v_npm" \
+      "$v_chatgpt" "$v_opencode_desk" "$v_aionui" "$v_ag_desk" "$v_cowork" "$v_orkas" "$v_hermes_desk"
     exit 0
+  fi
+
+  local uv_summary="$v_uv"
+  if [[ "$v_uv" != "none" && "$v_uv" != "not installed" ]]; then
+    local -a _uv_arr
+    read -ra _uv_arr <<< "$v_uv"
+    if [[ ${#_uv_arr[@]} -eq 1 ]]; then
+      uv_summary="${_uv_arr[0]%%@*}"
+    else
+      uv_summary="${#_uv_arr[@]} tool(s)"
+    fi
+  fi
+
+  local npm_summary="$v_npm"
+  if [[ "$v_npm" != "none" && "$v_npm" != "not installed" ]]; then
+    local -a _npm_arr
+    read -ra _npm_arr <<< "$v_npm"
+    npm_summary="${#_npm_arr[@]} package(s)"
   fi
 
   echo -e "${BOLD}${CYAN}╭────────────────────────────────────────────────────────────────────╮${RESET}"
@@ -627,287 +683,371 @@ print(json.dumps(data, indent=2))
   echo -e "${BOLD}${CYAN}╰────────────────────────────────────────────────────────────────────╯${RESET}"
   echo ""
   echo -e "  ${BOLD}${CYAN}◈ CLI HARNESSES & AGENT RUNTIMES${RESET}"
-  echo -e "  ╭──────────────────────────┬────────────────────────────┬──────────────╮"
-  echo -e "  │ Target                   │ Engine / Command           │ Version      │"
-  echo -e "  ├──────────────────────────┼────────────────────────────┼──────────────┤"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Google Antigravity" "agy" "$(get_version agy)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Claude Code" "claude" "$(get_version claude | awk '{print $1}')"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "OpenAI Codex" "codex" "$(get_version codex)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Hermes Agent" "hermes" "$(get_version hermes)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "OpenCode CLI" "opencode" "$(get_version opencode)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Xiaomi Mimocode" "mimo" "$(get_version mimo)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Kilo Agent" "kilo" "$(get_version kilo)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Goose CLI" "goose" "$(get_version goose)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Python uv Tools" "uv tool" "mistral-vibe"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "NPM AI Globals" "npm (global)" "3 packages"
-  echo -e "  ╰──────────────────────────┴────────────────────────────┴──────────────╯"
+  echo -e "  ╭──────────────────────────┬────────────────────────────┬────────────────╮"
+  echo -e "  │ Target                   │ Engine / Command           │ Version        │"
+  echo -e "  ├──────────────────────────┼────────────────────────────┼────────────────┤"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Google Antigravity" "agy" "${v_agy:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Claude Code" "claude" "${v_claude:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "OpenAI Codex" "codex" "${v_codex:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Hermes Agent" "hermes" "${v_hermes:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "OpenCode CLI" "opencode" "${v_opencode:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Xiaomi Mimocode" "mimo" "${v_mimo:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Kilo Agent" "kilo" "${v_kilo:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Goose CLI" "goose" "${v_goose:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Python uv Tools" "uv tool" "${uv_summary:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "NPM AI Globals" "npm (global)" "${npm_summary:0:14}"
+  echo -e "  ╰──────────────────────────┴────────────────────────────┴────────────────╯"
   echo ""
   echo -e "  ${BOLD}${MAGENTA}❖ DESKTOP AI APPS & WORKSPACES${RESET}"
-  echo -e "  ╭──────────────────────────┬────────────────────────────┬──────────────╮"
-  echo -e "  │ Application              │ Binary / Environment       │ Version      │"
-  echo -e "  ├──────────────────────────┼────────────────────────────┼──────────────┤"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "ChatGPT Desktop" "RPM (/usr/bin/chatgpt)" "$(get_version chatgpt)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "OpenCode Desktop" "RPM (/opt/OpenCode)" "$(get_version opencode-desktop)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "AionUi Workspace" "Electron (~/.local/opt)" "$(get_version aionui)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Antigravity IDE" "IDE (~/.local/share)" "$(get_version antigravity-desktop)"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "CoWork-OS Desktop" "Electron (~/CoWork-OS)" "$(get_version cowork-os | awk '{print $1}')"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Orkas Desktop Client" "Electron (~/Orkas)" "$(get_version orkas | awk '{print $1}')"
-  printf "  │ %-24s │ %-26s │ %-12s │\n" "Hermes Desktop UI" "UI (hermes desktop)" "Ready"
-  echo -e "  ╰──────────────────────────┴────────────────────────────┴──────────────╯"
+  echo -e "  ╭──────────────────────────┬────────────────────────────┬────────────────╮"
+  echo -e "  │ Application              │ Binary / Environment       │ Version        │"
+  echo -e "  ├──────────────────────────┼────────────────────────────┼────────────────┤"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "ChatGPT Desktop" "RPM (/usr/bin/chatgpt)" "${v_chatgpt:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "OpenCode Desktop" "RPM (/opt/OpenCode)" "${v_opencode_desk:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "AionUi Workspace" "Electron (~/.local/opt)" "${v_aionui:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Antigravity IDE" "IDE (~/.local/share)" "${v_ag_desk:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "CoWork-OS Desktop" "Electron (~/CoWork-OS)" "${v_cowork%% *}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Orkas Desktop Client" "Electron (~/Orkas)" "${v_orkas%% *}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Hermes Desktop UI" "UI (hermes desktop)" "${v_hermes_desk:0:14}"
+  echo -e "  ╰──────────────────────────┴────────────────────────────┴────────────────╯"
   echo ""
   exit 0
 }
 
-if [[ "$MODE" == "list" ]]; then
+# Shared updater helper for CLI self-updaters without a --check dry-run mode
+run_self_updater_cli() {
+  local id="$1"
+  local title="$2"
+  local bin="$3"
+  local subcmd="$4"
+  local step_msg="$5"
+  local uptodate_re="$6"
+  local updated_re="$7"
+
+  command -v "$bin" &>/dev/null || return 0
+  should_run "$id" "cli" || return 0
+
+  log_card_start "$title" "cli"
+  local t_start curr_v dur output rc=0 post_v
+  t_start=$(date +%s%N)
+  curr_v="$(get_version "$id")"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log_step "Installed version: ${curr_v}"
+    log_step "Skipping update execution (${bin} has no non-mutating --check mode)"
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "SKIPPED" "v${curr_v#v} (no CLI --check)" "$dur"
+    record_result "$id" "CLI" "SKIPPED" "No CLI --check" "$dur"
+    return 0
+  fi
+
+  log_step "$step_msg"
+  output="$("$bin" "$subcmd" 2>&1)" || rc=$?
+  printf '%s\n' "$output" | stream_progress 4
+  post_v="$(get_version "$id")"
+  dur="$(elapsed_since "$t_start")"
+
+  if [[ -n "$updated_re" ]] && printf '%s\n' "$output" | grep -qiE "$updated_re"; then
+    log_card_end "UPDATED" "Upgraded to ${post_v}" "$dur"
+    record_result "$id" "CLI" "UPDATED" "${post_v}" "$dur"
+  elif [[ "$post_v" != "$curr_v" && -n "$post_v" && "$post_v" != "not installed" ]]; then
+    log_card_end "UPDATED" "${curr_v} → ${post_v}" "$dur"
+    record_result "$id" "CLI" "UPDATED" "${post_v}" "$dur"
+  elif [[ $rc -ne 0 ]]; then
+    log_card_end "FAILED" "${bin} ${subcmd} exited ${rc}" "$dur"
+    record_result "$id" "CLI" "FAILED" "Exit ${rc}" "$dur"
+  elif [[ -n "$uptodate_re" ]] && printf '%s\n' "$output" | grep -qiE "$uptodate_re"; then
+    log_card_end "UP TO DATE" "Current (${post_v})" "$dur"
+    record_result "$id" "CLI" "UP TO DATE" "${post_v}" "$dur"
+  else
+    log_card_end "UP TO DATE" "Verified (${post_v})" "$dur"
+    record_result "$id" "CLI" "UP TO DATE" "${post_v}" "$dur"
+  fi
+}
+
+# Shared helper for local Electron/Node git desktop workspaces
+sync_git_desktop_repo() {
+  local id="$1"
+  local title="$2"
+  local repo_dir="$3"
+  local build_cmd="$4"
+
+  [[ -d "${repo_dir}/.git" ]] || return 0
+  should_run "$id" "desktop" || return 0
+
+  log_card_start "$title" "desktop"
+  local t_start dirty_count local_sha upstream_ref remote_name branch_name remote_sha dur git_out pull_rc=0 build_rc=0 stashed=0
+  t_start=$(date +%s%N)
+  dirty_count=$(git -C "$repo_dir" status --porcelain 2>/dev/null | wc -l)
+  local_sha=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")
+  upstream_ref=$(git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "origin/main")
+  remote_name="${upstream_ref%%/*}"
+  branch_name="${upstream_ref#*/}"
+
+  log_step "Checking local git working tree (${upstream_ref})..."
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log_step "Probing ${upstream_ref} (read-only ls-remote)..."
+    remote_sha=$(git -C "$repo_dir" ls-remote "$remote_name" "refs/heads/${branch_name}" 2>/dev/null | awk '{print $1}')
+    dur="$(elapsed_since "$t_start")"
+    if [[ -n "$remote_sha" && "$remote_sha" != "$local_sha" ]]; then
+      local note="New commits on ${upstream_ref}"
+      [[ $dirty_count -gt 0 ]] && note+=" (${dirty_count} local edits)"
+      log_card_end "UPDATE AVAIL" "$note" "$dur"
+      record_result "$id" "DESKTOP" "UPDATE AVAIL" "Origin ahead" "$dur"
+    elif [[ $dirty_count -gt 0 ]]; then
+      log_card_end "DIRTY (SKIPPED)" "${dirty_count} uncommitted files (up to date)" "$dur"
+      record_result "$id" "DESKTOP" "DIRTY (SKIPPED)" "${dirty_count} edits" "$dur"
+    else
+      log_card_end "UP TO DATE" "Matches ${upstream_ref}" "$dur"
+      record_result "$id" "DESKTOP" "UP TO DATE" "Up to date" "$dur"
+    fi
+    return 0
+  fi
+
+  if [[ $dirty_count -gt 0 && $FORCE_GIT -eq 0 ]]; then
+    log_step "Detected ${dirty_count} uncommitted files (use --force-git to stash & restore)"
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "DIRTY (SKIPPED)" "${dirty_count} uncommitted files" "$dur"
+    record_result "$id" "DESKTOP" "DIRTY (SKIPPED)" "${dirty_count} edits" "$dur"
+    return 0
+  fi
+
+  if [[ $FORCE_GIT -eq 1 && $dirty_count -gt 0 ]]; then
+    log_step "Stashing ${dirty_count} local change(s) (--force-git)..."
+    if git -C "$repo_dir" stash push -u -m "Auto-stashed by aiup" &>/dev/null; then
+      stashed=1
+    fi
+  fi
+
+  log_step "Pulling latest commits from ${upstream_ref}..."
+  git_out=$(git -C "$repo_dir" pull --ff-only "$remote_name" "$branch_name" 2>&1) || pull_rc=$?
+
+  if [[ $pull_rc -ne 0 ]]; then
+    log_step "Git pull failed (non-fast-forward or network error)"
+    printf '%s\n' "$git_out" | stream_progress 3
+    if [[ $stashed -eq 1 ]]; then
+      git -C "$repo_dir" stash pop &>/dev/null || log_step "Note: stashed edits kept in 'git stash list'"
+    fi
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "FAILED" "Git pull error (${pull_rc})" "$dur"
+    record_result "$id" "DESKTOP" "FAILED" "Git pull error" "$dur"
+    return 0
+  fi
+
+  if printf '%s\n' "$git_out" | grep -qi "Already up to date"; then
+    if [[ $stashed -eq 1 ]]; then
+      log_step "Restoring stashed local changes..."
+      git -C "$repo_dir" stash pop &>/dev/null || log_step "Note: stashed edits kept in 'git stash list'"
+    fi
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "UP TO DATE" "Already up to date" "$dur"
+    record_result "$id" "DESKTOP" "UP TO DATE" "Up to date" "$dur"
+    return 0
+  fi
+
+  log_step "Running build/dependency sync: ${build_cmd}"
+  NPM_DID_UPDATE=1
+  (cd "$repo_dir" && bash -lc "$build_cmd") 2>&1 | stream_progress 6 || build_rc=$?
+
+  if [[ $stashed -eq 1 ]]; then
+    log_step "Restoring stashed local changes..."
+    git -C "$repo_dir" stash pop &>/dev/null || log_step "Warning: stash pop had conflicts; run 'git stash pop' manually"
+  fi
+
+  dur="$(elapsed_since "$t_start")"
+  if [[ $build_rc -ne 0 ]]; then
+    log_card_end "FAILED" "Pulled commits, build exited ${build_rc}" "$dur"
+    record_result "$id" "DESKTOP" "FAILED" "Build failed (${build_rc})" "$dur"
+  else
+    log_card_end "UPDATED" "Pulled & synced workspace" "$dur"
+    record_result "$id" "DESKTOP" "UPDATED" "Pulled & built" "$dur"
+  fi
+}
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+if [[ $LIST_ONLY -eq 1 ]]; then
   list_harnesses
 fi
 
 if [[ "$OUTPUT_FORMAT" != "json" ]]; then
   echo -e "\n${BOLD}${CYAN}╭──────────────────────────────────────────────────────────────╮${RESET}"
-  if [[ "$MODE" == "check" ]]; then
-    echo -e "${BOLD}${CYAN}│${RESET}  ${YELLOW}🔍 [CHECK MODE] Scanning for AI Harness & App Updates...${RESET}    ${BOLD}${CYAN}│${RESET}"
-  elif [[ "$MODE" == "clean" ]]; then
-    echo -e "${BOLD}${CYAN}│${RESET}  ${BLUE}🧹 [CLEANUP MODE] Housekeeping & System Debloat...${RESET}           ${BOLD}${CYAN}│${RESET}"
+  if [[ "$MODE_LABEL" == "check" ]]; then
+    banner_txt="🔍 [CHECK MODE] Non-mutating scan (${FILTER_TYPE})..."
+    printf "${BOLD}${CYAN}│${RESET}  ${YELLOW}%-57s${RESET}  ${BOLD}${CYAN}│${RESET}\n" "$banner_txt"
+  elif [[ "$MODE_LABEL" == "clean" ]]; then
+    banner_txt="🧹 [CLEANUP MODE] Housekeeping & System Debloat..."
+    printf "${BOLD}${CYAN}│${RESET}  ${BLUE}%-57s${RESET}  ${BOLD}${CYAN}│${RESET}\n" "$banner_txt"
   else
-    echo -e "${BOLD}${CYAN}│${RESET}  ${BOLD}🚀 [UPDATE MODE] Syncing All AI Harnesses & Desktop Apps...${RESET} ${BOLD}${CYAN}│${RESET}"
+    banner_txt="🚀 [UPDATE MODE] Syncing AI Harnesses & Desktop Apps..."
+    printf "${BOLD}${CYAN}│${RESET}  ${BOLD}%-57s${RESET}  ${BOLD}${CYAN}│${RESET}\n" "$banner_txt"
   fi
   echo -e "${BOLD}${CYAN}╰──────────────────────────────────────────────────────────────╯${RESET}\n"
 fi
 
-# Pre-authenticate administrator privileges upfront if safe and applicable
-preauth_sudo_if_safe
+preauth_sudo_if_safe || true
 
 # ==============================================================================
 # SECTION 1: CLI HARNESSES & AGENTS
 # ==============================================================================
-if [[ ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli") && "$MODE" != "clean" ]]; then
+if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
   [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "${BOLD}${CYAN}◈ [SECTION 1] CLI HARNESSES & CORE AGENTS${RESET}\n"
 
-  # 1. Antigravity CLI (agy)
-  if command -v agy &>/dev/null && should_run "agy" "cli"; then
-    log_card_start "Antigravity CLI (agy)" "cli"
-    t_start=$(date +%s%N)
-    log_step "Checking official Google Antigravity release channel..."
-    output=$(agy update 2>&1 || true)
-    echo "$output" | stream_progress 4
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    if echo "$output" | grep -qi "already on the latest"; then
-      log_card_end "UP TO DATE" "Current version is latest" "$dur"
-      record_result "agy" "CLI" "UP TO DATE" "Current version latest" "$dur"
-    elif echo "$output" | grep -qi "success"; then
-      log_card_end "UPDATED" "Updated to newest build" "$dur"
-      record_result "agy" "CLI" "UPDATED" "Updated successfully" "$dur"
-    else
-      log_card_end "UP TO DATE" "Channel verified" "$dur"
-      record_result "agy" "CLI" "UP TO DATE" "Channel verified" "$dur"
-    fi
-  fi
+  run_self_updater_cli "agy"      "Antigravity CLI (agy)"     "agy"      "update"  "Checking Google Antigravity release channel..." "already on the latest" "success|updated"
+  run_self_updater_cli "claude"   "Claude Code (claude)"       "claude"   "update"  "Connecting to Anthropic update manifest..."     "already.*latest"       "Updated from|successfully updated"
+  run_self_updater_cli "codex"    "OpenAI Codex CLI (codex)"   "codex"    "update"  "Checking standalone binary release..."          "already up to date|latest" "Updated|Installed"
+  run_self_updater_cli "opencode" "OpenCode CLI (opencode)"    "opencode" "upgrade" "Checking upstream OpenCode CLI packages..."     "already installed"     "Upgrade complete|Upgraded"
+  run_self_updater_cli "mimo"     "Xiaomi Mimocode (mimo)"     "mimo"     "upgrade" "Connecting to Xiaomi Mimocode release..."       "already installed"     "Upgrade complete|Upgraded"
+  run_self_updater_cli "kilo"     "Kilo Agent (kilo)"          "kilo"     "upgrade" "Checking Kilo Agent distribution..."            "already installed"     "Upgrade complete|Upgraded"
+  run_self_updater_cli "goose"    "Goose CLI (goose)"          "goose"    "update"  "Checking Goose CLI latest release..."           "already on the latest" "successfully"
 
-  # 2. Claude Code (claude)
-  if command -v claude &>/dev/null && should_run "claude" "cli"; then
-    log_card_start "Claude Code (claude)" "cli"
-    t_start=$(date +%s%N)
-    log_step "Connecting to Anthropic update manifest..."
-    output=$(claude update 2>&1 || true)
-    echo "$output" | stream_progress 4
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    if echo "$output" | grep -qi "Updated from"; then
-      new_v=$(echo "$output" | grep -oE "to version [0-9.]+" | awk '{print $3}')
-      log_card_end "UPDATED" "Upgraded to v${new_v}" "$dur"
-      record_result "claude" "CLI" "UPDATED" "v${new_v}" "$dur"
-    elif echo "$output" | grep -qi "already.*latest"; then
-      log_card_end "UP TO DATE" "Already on latest version" "$dur"
-      record_result "claude" "CLI" "UP TO DATE" "Already latest" "$dur"
-    else
-      log_card_end "UP TO DATE" "Manifest verified" "$dur"
-      record_result "claude" "CLI" "UP TO DATE" "Verified" "$dur"
-    fi
-  fi
-
-  # 3. OpenAI Codex (codex)
-  if command -v codex &>/dev/null && should_run "codex" "cli"; then
-    log_card_start "OpenAI Codex CLI (codex)" "cli"
-    t_start=$(date +%s%N)
-    log_step "Resolving standalone binary from chatgpt.com..."
-    output=$(codex update 2>&1 || true)
-    echo "$output" | stream_progress 4
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    v=$(echo "$output" | grep -oE "Codex CLI [0-9.]+" | awk '{print $3}')
-    log_card_end "UP TO DATE" "Verified (v${v:-current})" "$dur"
-    record_result "codex" "CLI" "UP TO DATE" "v${v:-current}" "$dur"
-  fi
-
-  # 4. OpenCode CLI (opencode)
-  if command -v opencode &>/dev/null && should_run "opencode" "cli"; then
-    log_card_start "OpenCode CLI (opencode)" "cli"
-    t_start=$(date +%s%N)
-    log_step "Checking upstream OpenCode CLI packages..."
-    output=$(opencode upgrade 2>&1 || true)
-    echo "$output" | stream_progress 4
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    if echo "$output" | grep -qi "already installed"; then
-      log_card_end "UP TO DATE" "Already latest release" "$dur"
-      record_result "opencode" "CLI" "UP TO DATE" "Already latest" "$dur"
-    elif echo "$output" | grep -qi "Upgrade complete"; then
-      log_card_end "UPDATED" "Upgraded to latest" "$dur"
-      record_result "opencode" "CLI" "UPDATED" "Upgraded" "$dur"
-    else
-      log_card_end "UP TO DATE" "Verified" "$dur"
-      record_result "opencode" "CLI" "UP TO DATE" "Verified" "$dur"
-    fi
-  fi
-
-  # 5. Xiaomi Mimocode (mimo)
-  if command -v mimo &>/dev/null && should_run "mimo" "cli"; then
-    log_card_start "Xiaomi Mimocode (mimo)" "cli"
-    t_start=$(date +%s%N)
-    log_step "Connecting to Xiaomi Mimocode release endpoint..."
-    output=$(mimo upgrade 2>&1 || true)
-    echo "$output" | stream_progress 4
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    if echo "$output" | grep -qi "already installed"; then
-      log_card_end "UP TO DATE" "Already on latest version" "$dur"
-      record_result "mimo" "CLI" "UP TO DATE" "Already latest" "$dur"
-    elif echo "$output" | grep -qi "Upgrade complete"; then
-      log_card_end "UPDATED" "Upgraded successfully" "$dur"
-      record_result "mimo" "CLI" "UPDATED" "Upgraded" "$dur"
-    else
-      log_card_end "UP TO DATE" "Verified" "$dur"
-      record_result "mimo" "CLI" "UP TO DATE" "Verified" "$dur"
-    fi
-  fi
-
-  # 6. Kilo Agent (kilo)
-  if command -v kilo &>/dev/null && should_run "kilo" "cli"; then
-    log_card_start "Kilo Agent (kilo)" "cli"
-    t_start=$(date +%s%N)
-    log_step "Checking Kilo Agent distribution..."
-    output=$(kilo upgrade 2>&1 || true)
-    echo "$output" | stream_progress 4
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    if echo "$output" | grep -qi "already installed"; then
-      log_card_end "UP TO DATE" "Already on latest version" "$dur"
-      record_result "kilo" "CLI" "UP TO DATE" "Already latest" "$dur"
-    elif echo "$output" | grep -qi "Upgrade complete"; then
-      log_card_end "UPDATED" "Upgraded successfully" "$dur"
-      record_result "kilo" "CLI" "UPDATED" "Upgraded" "$dur"
-    else
-      log_card_end "UP TO DATE" "Verified" "$dur"
-      record_result "kilo" "CLI" "UP TO DATE" "Verified" "$dur"
-    fi
-  fi
-
-  # 7. Goose CLI (goose)
-  if command -v goose &>/dev/null && should_run "goose" "cli"; then
-    log_card_start "Goose CLI (goose)" "cli"
-    t_start=$(date +%s%N)
-    log_step "Checking Goose CLI latest release..."
-    output=$(goose update 2>&1 || true)
-    echo "$output" | stream_progress 4
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    if echo "$output" | grep -qi "already on the latest"; then
-      log_card_end "UP TO DATE" "Already on latest release" "$dur"
-      record_result "goose" "CLI" "UP TO DATE" "Already latest" "$dur"
-    elif echo "$output" | grep -qi "successfully"; then
-      log_card_end "UPDATED" "Upgraded successfully" "$dur"
-      record_result "goose" "CLI" "UPDATED" "Upgraded" "$dur"
-    else
-      log_card_end "UP TO DATE" "Verified" "$dur"
-      record_result "goose" "CLI" "UP TO DATE" "Verified" "$dur"
-    fi
-  fi
-
-  # 8. Hermes Agent (hermes)
+  # 8. Hermes Agent (supports native --check)
   if command -v hermes &>/dev/null && should_run "hermes" "cli"; then
     log_card_start "Hermes Agent (hermes)" "cli"
     t_start=$(date +%s%N)
-    if [[ "$MODE" == "check" ]]; then
-      log_step "Probing Hermes Agent git repository..."
-      output=$(hermes update --check 2>&1 || true)
-      echo "$output" | stream_progress 4
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      if echo "$output" | grep -qi "Update available"; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log_step "Probing Hermes Agent git repository (hermes update --check)..."
+      rc=0; output=$(hermes update --check 2>&1) || rc=$?
+      printf '%s\n' "$output" | stream_progress 4
+      dur="$(elapsed_since "$t_start")"
+      if printf '%s\n' "$output" | grep -qiE "Update available|behind"; then
         log_card_end "UPDATE AVAIL" "New commits on origin" "$dur"
         record_result "hermes" "CLI" "UPDATE AVAIL" "New commits on origin" "$dur"
+      elif [[ $rc -ne 0 ]]; then
+        log_card_end "FAILED" "hermes --check exited ${rc}" "$dur"
+        record_result "hermes" "CLI" "FAILED" "Exit ${rc}" "$dur"
       else
         log_card_end "UP TO DATE" "Up to date with origin" "$dur"
         record_result "hermes" "CLI" "UP TO DATE" "Up to date" "$dur"
       fi
     else
       log_step "Updating Hermes dependencies and core engine..."
-      output=$(hermes update --yes --no-gateway-restart 2>&1 || true)
-      echo "$output" | stream_progress 4
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      if echo "$output" | grep -qi "already up to date"; then
+      rc=0; output=$(hermes update --yes --no-gateway-restart 2>&1) || rc=$?
+      printf '%s\n' "$output" | stream_progress 4
+      dur="$(elapsed_since "$t_start")"
+      if printf '%s\n' "$output" | grep -qi "already up to date"; then
         log_card_end "UP TO DATE" "Already up to date" "$dur"
         record_result "hermes" "CLI" "UP TO DATE" "Up to date" "$dur"
-      elif [[ $? -eq 0 ]]; then
+      elif [[ $rc -ne 0 ]]; then
+        log_card_end "FAILED" "hermes update exited ${rc}" "$dur"
+        record_result "hermes" "CLI" "FAILED" "Exit ${rc}" "$dur"
+      elif printf '%s\n' "$output" | grep -qiE "Updated|Successfully|Pulled|Installed"; then
         log_card_end "UPDATED" "Dependencies & git synced" "$dur"
         record_result "hermes" "CLI" "UPDATED" "Synced" "$dur"
       else
-        log_card_end "UP TO DATE" "Completed with notices" "$dur"
-        record_result "hermes" "CLI" "UP TO DATE" "Notices logged" "$dur"
+        log_card_end "UP TO DATE" "Verified (exit 0)" "$dur"
+        record_result "hermes" "CLI" "UP TO DATE" "Verified" "$dur"
       fi
     fi
   fi
 
-  # 9. Python Tools via uv (mistral-vibe)
+  # 9. Python Tools via uv
   if command -v uv &>/dev/null && should_run "uv-tools" "cli"; then
-    log_card_start "Python uv Tools (mistral-vibe, etc.)" "cli"
+    log_card_start "Python uv Tools" "cli"
     t_start=$(date +%s%N)
-    log_step "Checking uv tool registry..."
-    output=$(uv tool upgrade --all 2>&1 || true)
-    echo "$output" | stream_progress 4
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    if echo "$output" | grep -qi "Nothing to upgrade"; then
-      log_card_end "UP TO DATE" "All uv tools current" "$dur"
-      record_result "uv-tools" "CLI" "UP TO DATE" "Tools current" "$dur"
-    elif echo "$output" | grep -qi "Upgraded"; then
-      log_card_end "UPDATED" "Upgraded installed tools" "$dur"
-      record_result "uv-tools" "CLI" "UPDATED" "Upgraded tools" "$dur"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log_step "Checking PyPI versions for installed uv tools..."
+      uv_updates=()
+      uv_checked=0
+      while read -r pkg ver _; do
+        [[ -z "$pkg" || "$pkg" == -* ]] && continue
+        ((uv_checked++)) || true
+        pypi_v=$(curl -s --connect-timeout 3 "https://pypi.org/pypi/${pkg}/json" 2>/dev/null | jq -r '.info.version // empty' 2>/dev/null || true)
+        if [[ -n "$pypi_v" ]] && is_version_gt "$pypi_v" "$ver"; then
+          uv_updates+=("${pkg}:${ver}→${pypi_v}")
+          log_step "Update available: ${pkg} (${ver} → ${pypi_v})"
+        fi
+      done < <(uv tool list 2>/dev/null | grep -E '^[a-zA-Z0-9._-]+\s+v?[0-9]')
+      dur="$(elapsed_since "$t_start")"
+      if [[ ${#uv_updates[@]} -gt 0 ]]; then
+        log_card_end "UPDATE AVAIL" "${#uv_updates[@]} tool(s) upgradable" "$dur"
+        record_result "uv-tools" "CLI" "UPDATE AVAIL" "${#uv_updates[@]} upgradable" "$dur"
+      else
+        log_card_end "UP TO DATE" "${uv_checked} uv tool(s) current" "$dur"
+        record_result "uv-tools" "CLI" "UP TO DATE" "${uv_checked} tools current" "$dur"
+      fi
     else
-      log_card_end "UP TO DATE" "Checked" "$dur"
-      record_result "uv-tools" "CLI" "UP TO DATE" "Checked" "$dur"
+      log_step "Upgrading installed uv tools..."
+      rc=0; output=$(uv tool upgrade --all 2>&1) || rc=$?
+      printf '%s\n' "$output" | stream_progress 4
+      dur="$(elapsed_since "$t_start")"
+      if [[ $rc -ne 0 ]]; then
+        log_card_end "FAILED" "uv tool upgrade exited ${rc}" "$dur"
+        record_result "uv-tools" "CLI" "FAILED" "Exit ${rc}" "$dur"
+      elif printf '%s\n' "$output" | grep -qi "Nothing to upgrade"; then
+        log_card_end "UP TO DATE" "All uv tools current" "$dur"
+        record_result "uv-tools" "CLI" "UP TO DATE" "Tools current" "$dur"
+      elif printf '%s\n' "$output" | grep -qiE "Updated|Upgraded|Installed"; then
+        log_card_end "UPDATED" "Upgraded installed tools" "$dur"
+        record_result "uv-tools" "CLI" "UPDATED" "Upgraded tools" "$dur"
+      else
+        log_card_end "UP TO DATE" "Verified" "$dur"
+        record_result "uv-tools" "CLI" "UP TO DATE" "Verified" "$dur"
+      fi
     fi
   fi
 
-  # 10. NPM AI Global Packages
+  # 10. NPM Global AI Packages
   if command -v npm &>/dev/null && should_run "npm-globals" "cli"; then
-    log_card_start "NPM Global AI Packages (command-code, qwen-code, cline)" "cli"
+    log_card_start "NPM Global AI Packages" "cli"
     t_start=$(date +%s%N)
-    npm_targets=()
-    for pkg in "command-code" "@qwen-code/qwen-code" "cline"; do
-      if [[ -n "$(get_npm_pkg_version "$pkg")" ]]; then
-        npm_targets+=("${pkg}@latest")
+    node_root="$(get_npm_root_global)"
+    npm_installed=()
+    npm_upgradable=()
+    npm_updated_count=0
+    npm_fail_count=0
+
+    for pkg in "${TRACKED_NPM_PKGS[@]}"; do
+      if [[ -L "${node_root}/${pkg}" ]]; then
+        log_step "Skipping symlinked local checkout: ${pkg}"
+        continue
+      fi
+      curr_v="$(get_npm_pkg_version "$pkg")"
+      [[ -z "$curr_v" ]] && continue
+      npm_installed+=("$pkg")
+      latest_v=$(npm view "$pkg" version 2>/dev/null || true)
+      if [[ -n "$latest_v" ]] && is_version_gt "$latest_v" "$curr_v"; then
+        npm_upgradable+=("${pkg}@${latest_v}")
+        log_step "Newer version available: ${pkg} (${curr_v} → ${latest_v})"
       fi
     done
 
-    if [[ ${#npm_targets[@]} -gt 0 ]]; then
-      log_step "Detected packages: ${npm_targets[*]}"
-      if [[ "$MODE" == "check" ]]; then
-        t_end=$(date +%s%N)
-        dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-        log_card_end "UP TO DATE" "${#npm_targets[@]} packages installed" "$dur"
-        record_result "npm-globals" "CLI" "UP TO DATE" "${#npm_targets[@]} packages" "$dur"
+    if [[ ${#npm_installed[@]} -eq 0 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "No tracked global packages installed" "$dur"
+      record_result "npm-globals" "CLI" "SKIPPED" "None installed" "$dur"
+    elif [[ $DRY_RUN -eq 1 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      if [[ ${#npm_upgradable[@]} -gt 0 ]]; then
+        log_card_end "UPDATE AVAIL" "${#npm_upgradable[@]} package(s) upgradable" "$dur"
+        record_result "npm-globals" "CLI" "UPDATE AVAIL" "${#npm_upgradable[@]} upgradable" "$dur"
       else
-        for target in "${npm_targets[@]}"; do
-          log_step "Installing ${target}..."
-          npm install -g "$target" 2>&1 | stream_progress 2 || true
-        done
-        t_end=$(date +%s%N)
-        dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-        log_card_end "UPDATED" "Refreshed ${#npm_targets[@]} packages" "$dur"
-        record_result "npm-globals" "CLI" "UPDATED" "Refreshed packages" "$dur"
+        log_card_end "UP TO DATE" "${#npm_installed[@]} tracked package(s) current" "$dur"
+        record_result "npm-globals" "CLI" "UP TO DATE" "${#npm_installed[@]} current" "$dur"
+      fi
+    elif [[ ${#npm_upgradable[@]} -eq 0 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "UP TO DATE" "${#npm_installed[@]} tracked package(s) current" "$dur"
+      record_result "npm-globals" "CLI" "UP TO DATE" "${#npm_installed[@]} current" "$dur"
+    else
+      for target in "${npm_upgradable[@]}"; do
+        log_step "Installing ${target}..."
+        NPM_DID_UPDATE=1
+        if npm install -g "$target" 2>&1 | stream_progress 3; then
+          ((npm_updated_count++)) || true
+        else
+          ((npm_fail_count++)) || true
+        fi
+      done
+      dur="$(elapsed_since "$t_start")"
+      if [[ $npm_fail_count -gt 0 ]]; then
+        log_card_end "FAILED" "Updated ${npm_updated_count}, failed ${npm_fail_count}" "$dur"
+        record_result "npm-globals" "CLI" "FAILED" "${npm_fail_count} failed" "$dur"
+      else
+        log_card_end "UPDATED" "Upgraded ${npm_updated_count} package(s)" "$dur"
+        record_result "npm-globals" "CLI" "UPDATED" "${npm_updated_count} upgraded" "$dur"
       fi
     fi
   fi
@@ -916,7 +1056,7 @@ fi
 # ==============================================================================
 # SECTION 2: DESKTOP AI APPS & WORKSPACES
 # ==============================================================================
-if [[ ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "desktop") && "$MODE" != "clean" ]]; then
+if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "desktop" ]]; then
   [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "${BOLD}${MAGENTA}❖ [SECTION 2] DESKTOP AI APPS & WORKSPACES${RESET}\n"
 
   # 11. ChatGPT Desktop App
@@ -925,236 +1065,223 @@ if [[ ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "desktop") && "$MODE" != "cl
     t_start=$(date +%s%N)
     curr_v="$(get_version chatgpt)"
 
-    if [[ $PKG_MGR == "dnf" ]]; then
-      log_step "Checking official DNF repository (https://persistent.oaistatic.com/codex-app-prod)..."
-      dnf_out=$(dnf check-update chatgpt 2>&1 || true)
-      dnf_rc=$?
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+    if [[ "$PKG_MGR" == "dnf" ]]; then
+      log_step "Checking official DNF repository (chatgpt.repo)..."
+      dnf_rc=0
+      dnf_out=$(dnf check-update chatgpt 2>&1) || dnf_rc=$?
 
       if [[ $dnf_rc -eq 100 ]]; then
-        avail_v=$(echo "$dnf_out" | grep -i chatgpt | awk '{print $2}' | head -n 1)
+        avail_v=$(printf '%s\n' "$dnf_out" | awk '/chatgpt/ {print $2; exit}')
         log_step "Found newer version: ${avail_v:-latest} (current: ${curr_v})"
-        if [[ "$MODE" == "check" ]]; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+          dur="$(elapsed_since "$t_start")"
           log_card_end "UPDATE AVAIL" "${curr_v} → ${avail_v:-latest}" "$dur"
           record_result "chatgpt" "DESKTOP" "UPDATE AVAIL" "${avail_v:-latest}" "$dur"
         else
           log_step "Attempting DNF upgrade for ChatGPT Desktop..."
-          if run_privileged "ChatGPT Desktop upgrade" dnf upgrade -y chatgpt 2>&1 | stream_progress 4; then
-            log_card_end "UPDATED" "Upgraded via DNF" "$dur"
-            record_result "chatgpt" "DESKTOP" "UPDATED" "Upgraded" "$dur"
-          else
-            log_card_end "UPDATE AVAIL" "Run: sudo dnf upgrade -y chatgpt" "$dur"
+          upg_rc=0
+          run_privileged "ChatGPT Desktop upgrade" dnf upgrade -y chatgpt 2>&1 | stream_progress 4 || upg_rc=$?
+          dur="$(elapsed_since "$t_start")"
+          if [[ $upg_rc -eq 0 ]]; then
+            log_card_end "UPDATED" "Upgraded via DNF (${avail_v:-latest})" "$dur"
+            record_result "chatgpt" "DESKTOP" "UPDATED" "${avail_v:-Upgraded}" "$dur"
+          elif [[ $upg_rc -eq 1 || $upg_rc -eq 2 ]]; then
+            log_card_end "UPDATE AVAIL" "Auth skipped; run: sudo dnf upgrade -y chatgpt" "$dur"
             record_result "chatgpt" "DESKTOP" "UPDATE AVAIL" "sudo dnf upgrade" "$dur"
+          else
+            log_card_end "FAILED" "DNF upgrade exited ${upg_rc}" "$dur"
+            record_result "chatgpt" "DESKTOP" "FAILED" "DNF error (${upg_rc})" "$dur"
           fi
         fi
+      elif [[ $dnf_rc -ne 0 ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "FAILED" "DNF check-update exited ${dnf_rc}" "$dur"
+        record_result "chatgpt" "DESKTOP" "FAILED" "DNF check error" "$dur"
       else
+        dur="$(elapsed_since "$t_start")"
         log_card_end "UP TO DATE" "Version ${curr_v} is current" "$dur"
         record_result "chatgpt" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
       fi
     else
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      log_card_end "UP TO DATE" "Version ${curr_v} is installed" "$dur"
-      record_result "chatgpt" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "v${curr_v} (auto-upgrade requires DNF)" "$dur"
+      record_result "chatgpt" "DESKTOP" "SKIPPED" "Requires DNF" "$dur"
     fi
   fi
 
   # 12. OpenCode Desktop App
-  if (rpm -q opencode &>/dev/null || [[ -d "/opt/OpenCode" ]]) && should_run "opencode-desktop" "desktop"; then
+  if (( command -v rpm &>/dev/null && rpm -q opencode &>/dev/null ) || [[ -d "/opt/OpenCode" ]]) && should_run "opencode-desktop" "desktop"; then
     log_card_start "OpenCode Desktop App (opencode-desktop)" "desktop"
     t_start=$(date +%s%N)
     curr_v="$(get_version opencode-desktop)"
-    log_step "Inspecting local desktop installation (v${curr_v})..."
-    log_step "Querying GitHub releases (anomalyco/opencode)..."
-    latest_tag=$(curl -s --connect-timeout 3 https://api.github.com/repos/anomalyco/opencode/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
 
-    if [[ -n "$latest_tag" && "$latest_tag" != "$curr_v" ]]; then
-      log_step "Found new release: v${latest_tag} (local: v${curr_v})"
-      if [[ "$MODE" == "check" ]]; then
-        log_card_end "UPDATE AVAIL" "v${curr_v} → v${latest_tag}" "$dur"
-        record_result "opencode-desktop" "DESKTOP" "UPDATE AVAIL" "v${latest_tag}" "$dur"
-      else
-        rpm_cache="${HOME}/.cache/@opencode-aidesktop-updater/pending/opencode-desktop-linux-x86_64.rpm"
-        mkdir -p "$(dirname "$rpm_cache")"
-        rpm_url="https://github.com/anomalyco/opencode/releases/download/v${latest_tag}/opencode-desktop-linux-x86_64.rpm"
-
-        need_download=1
-        if [[ -f "$rpm_cache" ]] && command -v rpm &>/dev/null; then
-          cached_v=$(rpm -qp "$rpm_cache" --queryformat "%{VERSION}" 2>/dev/null || true)
-          if [[ "$cached_v" == "$latest_tag" ]]; then
-            log_step "Verified ready cached RPM package (v${cached_v}) at ${rpm_cache}"
-            need_download=0
-          fi
-        fi
-
-        download_ok=0
-        if [[ $need_download -eq 0 ]]; then
-          download_ok=1
-        else
-          log_step "Downloading RPM package from ${rpm_url}..."
-          if curl -fL --connect-timeout 5 -o "$rpm_cache" "$rpm_url" 2>&1 | stream_progress 2; then
-            log_step "Package cached at ${rpm_cache}"
-            download_ok=1
-          fi
-        fi
-
-        if [[ $download_ok -eq 1 ]]; then
-          log_step "Installing RPM package (v${latest_tag})..."
-          if run_privileged "OpenCode Desktop RPM installation" rpm -U "$rpm_cache" 2>&1 | stream_progress 4; then
-            log_step "Installed RPM package successfully"
-            log_card_end "UPDATED" "Installed v${latest_tag}" "$dur"
-            record_result "opencode-desktop" "DESKTOP" "UPDATED" "v${latest_tag}" "$dur"
-          else
-            log_step "Privileged installation not completed"
-            log_card_end "CACHED" "Run: sudo rpm -U ${rpm_cache}" "$dur"
-            record_result "opencode-desktop" "DESKTOP" "CACHED" "RPM ready" "$dur"
-          fi
-        else
-          log_card_end "UPDATE AVAIL" "v${latest_tag} available" "$dur"
-          record_result "opencode-desktop" "DESKTOP" "UPDATE AVAIL" "v${latest_tag}" "$dur"
-        fi
-      fi
+    if [[ "$curr_v" == "unmanaged" || "$curr_v" == "not installed" || "$ARCH" != "x86_64" || "$PKG_MGR" != "dnf" ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "Requires x86_64 RPM install (detected: ${curr_v}, ${ARCH}/${PKG_MGR})" "$dur"
+      record_result "opencode-desktop" "DESKTOP" "SKIPPED" "Unsupported pkg" "$dur"
     else
-      log_card_end "UP TO DATE" "Version v${curr_v} is current" "$dur"
-      record_result "opencode-desktop" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
+      log_step "Inspecting local RPM installation (v${curr_v})..."
+      log_step "Querying OpenCode release manifest (latest-linux.yml)..."
+      yml_data=$(curl -fsSL --connect-timeout 4 https://github.com/anomalyco/opencode/releases/latest/download/latest-linux.yml 2>/dev/null || true)
+      latest_tag=""
+      expected_sha512=""
+      if [[ -n "$yml_data" ]]; then
+        latest_tag=$(printf '%s\n' "$yml_data" | awk '/^version:/ {print $2; exit}' | tr -d "'\"" | sed 's/^v//')
+        expected_sha512=$(printf '%s\n' "$yml_data" | awk '
+          /- url: opencode-desktop-linux-x86_64\.rpm/ {found=1; next}
+          found && /sha512:/ {print $2; exit}
+          found && /- url:/ {exit}
+        ' | tr -d "'\"")
+      else
+        log_step "Falling back to GitHub releases API..."
+        latest_tag=$(curl -s --connect-timeout 4 https://api.github.com/repos/anomalyco/opencode/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
+      fi
+
+      if [[ -z "$latest_tag" ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "FAILED" "Could not query upstream OpenCode release" "$dur"
+        record_result "opencode-desktop" "DESKTOP" "FAILED" "Query failed" "$dur"
+      elif is_version_gt "$latest_tag" "$curr_v"; then
+        log_step "Found newer release: v${latest_tag} (local: v${curr_v})"
+        if [[ $DRY_RUN -eq 1 ]]; then
+          dur="$(elapsed_since "$t_start")"
+          log_card_end "UPDATE AVAIL" "v${curr_v} → v${latest_tag}" "$dur"
+          record_result "opencode-desktop" "DESKTOP" "UPDATE AVAIL" "v${latest_tag}" "$dur"
+        else
+          rpm_cache="${HOME}/.cache/@opencode-aidesktop-updater/pending/opencode-desktop-linux-x86_64.rpm"
+          mkdir -p "$(dirname "$rpm_cache")"
+          rpm_url="https://github.com/anomalyco/opencode/releases/download/v${latest_tag}/opencode-desktop-linux-x86_64.rpm"
+
+          need_download=1
+          if [[ -f "$rpm_cache" ]]; then
+            cached_v=$(rpm -qp "$rpm_cache" --queryformat "%{VERSION}" 2>/dev/null || true)
+            if [[ "$cached_v" == "$latest_tag" ]]; then
+              if [[ -z "$expected_sha512" ]] || verify_sha512_b64 "$rpm_cache" "$expected_sha512"; then
+                log_step "Verified ready cached RPM (v${cached_v}) at ${rpm_cache}"
+                need_download=0
+              else
+                log_step "Cached RPM checksum mismatch; re-downloading..."
+                rm -f "$rpm_cache"
+              fi
+            fi
+          fi
+
+          download_ok=0
+          if [[ $need_download -eq 0 ]]; then
+            download_ok=1
+          else
+            log_step "Downloading RPM package from ${rpm_url}..."
+            rpm_tmp="${rpm_cache}.part"
+            if curl -fL --connect-timeout 5 -o "$rpm_tmp" "$rpm_url" 2>&1 | stream_progress 2; then
+              mv -f "$rpm_tmp" "$rpm_cache"
+              log_step "Downloaded RPM to ${rpm_cache}"
+              download_ok=1
+            else
+              rm -f "$rpm_tmp"
+            fi
+          fi
+
+          if [[ $download_ok -eq 1 ]]; then
+            # Integrity & digest verification before privileged install
+            integrity_ok=1
+            if [[ -n "$expected_sha512" ]]; then
+              if verify_sha512_b64 "$rpm_cache" "$expected_sha512"; then
+                log_step "SHA-512 digest verified against latest-linux.yml"
+              else
+                log_step "ERROR: SHA-512 verification failed for ${rpm_cache}"
+                rm -f "$rpm_cache"
+                integrity_ok=0
+              fi
+            fi
+            if [[ $integrity_ok -eq 1 ]] && ! rpm -K --nosignature "$rpm_cache" &>/dev/null; then
+              log_step "ERROR: RPM header/payload integrity check failed"
+              rm -f "$rpm_cache"
+              integrity_ok=0
+            fi
+
+            if [[ $integrity_ok -eq 0 ]]; then
+              dur="$(elapsed_since "$t_start")"
+              log_card_end "FAILED" "Downloaded RPM failed integrity check" "$dur"
+              record_result "opencode-desktop" "DESKTOP" "FAILED" "Bad checksum" "$dur"
+            else
+              log_step "Installing verified RPM package (v${latest_tag})..."
+              inst_rc=0
+              run_privileged "OpenCode Desktop RPM installation" rpm -U "$rpm_cache" 2>&1 | stream_progress 4 || inst_rc=$?
+              dur="$(elapsed_since "$t_start")"
+              if [[ $inst_rc -eq 0 ]]; then
+                log_step "Installed RPM package successfully"
+                log_card_end "UPDATED" "Installed v${latest_tag}" "$dur"
+                record_result "opencode-desktop" "DESKTOP" "UPDATED" "v${latest_tag}" "$dur"
+              elif [[ $inst_rc -eq 1 || $inst_rc -eq 2 ]]; then
+                log_step "Privileged installation deferred"
+                log_card_end "CACHED" "Run: sudo rpm -U ${rpm_cache}" "$dur"
+                record_result "opencode-desktop" "DESKTOP" "CACHED" "RPM ready" "$dur"
+              else
+                log_card_end "FAILED" "rpm -U exited ${inst_rc}" "$dur"
+                record_result "opencode-desktop" "DESKTOP" "FAILED" "RPM error (${inst_rc})" "$dur"
+              fi
+            fi
+          else
+            dur="$(elapsed_since "$t_start")"
+            log_card_end "FAILED" "Download failed for v${latest_tag}" "$dur"
+            record_result "opencode-desktop" "DESKTOP" "FAILED" "Download failed" "$dur"
+          fi
+        fi
+      else
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "UP TO DATE" "Version v${curr_v} is current (latest: v${latest_tag})" "$dur"
+        record_result "opencode-desktop" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
+      fi
     fi
   fi
 
-  # 13. AionUi Desktop Workspace
+  # 13. AionUi Desktop Workspace (check/notify; no Linux self-install asset configured)
   if [[ -d "$HOME/.local/opt/AionUi" ]] && should_run "aionui" "desktop"; then
     log_card_start "AionUi AI Workspace (aionui)" "desktop"
     t_start=$(date +%s%N)
     curr_v=$(get_asar_version "$HOME/.local/opt/AionUi/resources/app.asar")
-    log_step "Reading internal application asar package (v${curr_v})..."
+    log_step "Reading local app.asar (v${curr_v})..."
     log_step "Checking GitHub releases for iOfficeAI/AionUi..."
     latest_tag=$(curl -s --connect-timeout 3 https://api.github.com/repos/iOfficeAI/AionUi/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+    dur="$(elapsed_since "$t_start")"
 
-    if [[ -n "$latest_tag" && "$latest_tag" != "$curr_v" ]]; then
-      log_step "New release available on GitHub: v${latest_tag}"
-      log_card_end "UPDATE AVAIL" "v${curr_v} → v${latest_tag}" "$dur"
-      record_result "aionui" "DESKTOP" "UPDATE AVAIL" "v${latest_tag}" "$dur"
+    if [[ -z "$latest_tag" ]]; then
+      log_card_end "SKIPPED" "GitHub check unavailable (local v${curr_v})" "$dur"
+      record_result "aionui" "DESKTOP" "SKIPPED" "Check failed" "$dur"
+    elif is_version_gt "$latest_tag" "$curr_v"; then
+      log_step "New release available: v${latest_tag} (manual download)"
+      log_card_end "UPDATE AVAIL" "v${curr_v} → v${latest_tag} (manual)" "$dur"
+      record_result "aionui" "DESKTOP" "UPDATE AVAIL" "v${latest_tag} (manual)" "$dur"
     else
       log_card_end "UP TO DATE" "Version v${curr_v} is current" "$dur"
       record_result "aionui" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
     fi
   fi
 
-  # 14. Google Antigravity Desktop IDE
+  # 14. Google Antigravity Desktop IDE (local inspection; IDE manages shell)
   if [[ -d "$HOME/.local/share/antigravity" ]] && should_run "antigravity-desktop" "desktop"; then
-    log_card_start "Google Antigravity IDE (antigravity)" "desktop"
+    log_card_start "Google Antigravity IDE (antigravity-desktop)" "desktop"
     t_start=$(date +%s%N)
     curr_v=$(get_asar_version "$HOME/.local/share/antigravity/resources/app.asar")
-    log_step "Inspecting Antigravity IDE shell (v${curr_v})..."
-    log_step "Engine, language server, and agent tools managed via 'agy'"
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    log_card_end "UP TO DATE" "IDE v${curr_v} (Engine: agy)" "$dur"
-    record_result "antigravity" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
+    log_step "Local IDE shell v${curr_v} (~/.local/share/antigravity)"
+    log_step "Auto-updated internally by Antigravity Desktop; CLI engine updated via 'agy'"
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "SKIPPED" "IDE v${curr_v} (self-managed)" "$dur"
+    record_result "antigravity-desktop" "DESKTOP" "SKIPPED" "v${curr_v} (self-managed)" "$dur"
   fi
 
-  # 15. CoWork-OS Desktop / Repo (~/CoWork-OS)
-  if [[ -d "$HOME/CoWork-OS/.git" ]] && should_run "cowork-os" "desktop"; then
-    log_card_start "CoWork-OS Desktop (~/CoWork-OS)" "desktop"
-    t_start=$(date +%s%N)
-    dirty_count=$(git -C "$HOME/CoWork-OS" status --porcelain 2>/dev/null | wc -l)
-    log_step "Checking local git working tree..."
-    if [[ $dirty_count -gt 0 && $FORCE_GIT -eq 0 ]]; then
-      log_step "Detected ${dirty_count} uncommitted files in repository"
-      log_step "Safety protection active: skipping pull to preserve local edits"
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      log_card_end "DIRTY (SKIPPED)" "${dirty_count} uncommitted files" "$dur"
-      record_result "cowork-os" "DESKTOP" "DIRTY (SKIPPED)" "${dirty_count} edits" "$dur"
-    elif [[ "$MODE" == "check" ]]; then
-      log_step "Fetching origin/main..."
-      git -C "$HOME/CoWork-OS" fetch origin main &>/dev/null || true
-      behind=$(git -C "$HOME/CoWork-OS" rev-list HEAD..origin/main --count 2>/dev/null || echo 0)
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      if [[ "$behind" -gt 0 ]]; then
-        log_card_end "UPDATE AVAIL" "${behind} commits behind origin" "$dur"
-        record_result "cowork-os" "DESKTOP" "UPDATE AVAIL" "${behind} commits behind" "$dur"
-      else
-        log_card_end "UP TO DATE" "Up to date with origin/main" "$dur"
-        record_result "cowork-os" "DESKTOP" "UP TO DATE" "Up to date" "$dur"
-      fi
-    else
-      if [[ $FORCE_GIT -eq 1 && $dirty_count -gt 0 ]]; then
-        log_step "Stashing local changes (--force-git)..."
-        git -C "$HOME/CoWork-OS" stash push -m "Auto-stashed by aiup" &>/dev/null || true
-      fi
-      log_step "Pulling latest commits from origin/main..."
-      git_out=$(git -C "$HOME/CoWork-OS" pull --ff-only origin main 2>&1 || true)
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      if echo "$git_out" | grep -qi "Already up to date"; then
-        log_card_end "UP TO DATE" "Already up to date" "$dur"
-        record_result "cowork-os" "DESKTOP" "UP TO DATE" "Up to date" "$dur"
-      else
-        log_step "Rebuilding CLI and Electron runtime..."
-        (cd "$HOME/CoWork-OS" && npm install --silent && npm run build:cli &>/dev/null && npm run build:electron &>/dev/null) 2>&1 | stream_progress 4 || true
-        log_card_end "UPDATED" "Pulled & rebuilt desktop" "$dur"
-        record_result "cowork-os" "DESKTOP" "UPDATED" "Rebuilt" "$dur"
-      fi
-    fi
-  fi
-
-  # 16. Orkas Desktop Client (~/Orkas)
-  if [[ -d "$HOME/Orkas/.git" ]] && should_run "orkas" "desktop"; then
-    log_card_start "Orkas Desktop Client (~/Orkas)" "desktop"
-    t_start=$(date +%s%N)
-    dirty_count=$(git -C "$HOME/Orkas" status --porcelain 2>/dev/null | wc -l)
-    log_step "Inspecting local Orkas git checkout..."
-    if [[ $dirty_count -gt 0 && $FORCE_GIT -eq 0 ]]; then
-      log_step "Detected ${dirty_count} uncommitted files in repository"
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      log_card_end "DIRTY (SKIPPED)" "${dirty_count} uncommitted files" "$dur"
-      record_result "orkas" "DESKTOP" "DIRTY (SKIPPED)" "${dirty_count} edits" "$dur"
-    elif [[ "$MODE" == "check" ]]; then
-      log_step "Fetching origin/main..."
-      git -C "$HOME/Orkas" fetch origin main &>/dev/null || true
-      behind=$(git -C "$HOME/Orkas" rev-list HEAD..origin/main --count 2>/dev/null || echo 0)
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      if [[ "$behind" -gt 0 ]]; then
-        log_card_end "UPDATE AVAIL" "${behind} commits behind origin" "$dur"
-        record_result "orkas" "DESKTOP" "UPDATE AVAIL" "${behind} commits behind" "$dur"
-      else
-        log_card_end "UP TO DATE" "Up to date with origin/main" "$dur"
-        record_result "orkas" "DESKTOP" "UP TO DATE" "Up to date" "$dur"
-      fi
-    else
-      log_step "Syncing origin/main and npm dependencies..."
-      git_out=$(git -C "$HOME/Orkas" pull --ff-only origin main 2>&1 || true)
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      if echo "$git_out" | grep -qi "Already up to date"; then
-        log_card_end "UP TO DATE" "Already up to date" "$dur"
-        record_result "orkas" "DESKTOP" "UP TO DATE" "Up to date" "$dur"
-      else
-        (cd "$HOME/Orkas" && npm install --silent &>/dev/null) 2>&1 | stream_progress 2 || true
-        log_card_end "UPDATED" "Dependencies refreshed" "$dur"
-        record_result "orkas" "DESKTOP" "UPDATED" "Refreshed" "$dur"
-      fi
-    fi
-  fi
+  # 15 & 16. Local Git Desktop Repositories (CoWork-OS & Orkas)
+  sync_git_desktop_repo "cowork-os" "CoWork-OS Desktop (~/CoWork-OS)" "$HOME/CoWork-OS" "npm install --silent && npm run build"
+  sync_git_desktop_repo "orkas"     "Orkas Desktop Client (~/Orkas)"   "$HOME/Orkas"     "npm install --silent"
 
   # 17. Hermes Desktop UI
   if command -v hermes &>/dev/null && should_run "hermes-desktop" "desktop"; then
     log_card_start "Hermes Desktop UI (hermes-desktop)" "desktop"
     t_start=$(date +%s%N)
-    log_step "Checking Hermes desktop frontend components..."
-    log_step "Desktop UI assets synced directly with Hermes core engine"
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    log_card_end "UP TO DATE" "Synced via hermes core" "$dur"
-    record_result "hermes-desktop" "DESKTOP" "UP TO DATE" "Synced" "$dur"
+    log_step "Built/launched on demand via 'hermes desktop' from core hermes-agent checkout"
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "SKIPPED" "Bundled with 'hermes' core" "$dur"
+    record_result "hermes-desktop" "DESKTOP" "SKIPPED" "Bundled w/ hermes" "$dur"
   fi
 fi
 
@@ -1168,24 +1295,24 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
   if command -v uv &>/dev/null && should_run "clean-uv" "clean"; then
     log_card_start "Python uv Cache & Environments" "clean"
     t_start=$(date +%s%N)
-    log_step "Pruning dangling wheel builds and orphaned cache entries..."
-    if [[ "$MODE" == "check" ]]; then
+    log_step "Checking dangling wheel builds and orphaned cache entries..."
+    if [[ $DRY_RUN -eq 1 ]]; then
       uv_sz=$(du -sh "$HOME/.cache/uv" 2>/dev/null | awk '{print $1}' || echo "0B")
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+      dur="$(elapsed_since "$t_start")"
       log_card_end "UP TO DATE" "Cache footprint: ${uv_sz}" "$dur"
-      record_result "clean-uv" "CLEAN" "UP TO DATE" "Cache: ${uv_sz}" "$dur"
+      record_result "clean-uv" "CLEAN" "UP TO DATE" "Footprint: ${uv_sz}" "$dur"
     else
       uv_out=$(uv cache prune 2>&1 || true)
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      if echo "$uv_out" | grep -qi "Removed"; then
-        freed=$(echo "$uv_out" | grep -oE "Removed [^)]+\)" | sed 's/Removed //')
-        log_card_end "CLEANED" "Pruned dangling files (${freed})" "$dur"
-        record_result "clean-uv" "CLEAN" "CLEANED" "Pruned: ${freed}" "$dur"
+      dur="$(elapsed_since "$t_start")"
+      if printf '%s\n' "$uv_out" | grep -qi "Removed [1-9]"; then
+        uv_files=$(printf '%s\n' "$uv_out" | grep -oE 'Removed [0-9]+ files?' | awk '{print $2 " " $3}')
+        uv_bytes=$(printf '%s\n' "$uv_out" | grep -oE '\([^)]+\)' | tr -d '()' | head -n 1)
+        uv_detail="${uv_files}${uv_bytes:+, ${uv_bytes}}"
+        log_card_end "CLEANED" "Pruned ${uv_detail}" "$dur"
+        record_result "clean-uv" "CLEAN" "CLEANED" "$uv_detail" "$dur"
       else
         log_card_end "UP TO DATE" "Cache optimal (0 dangling files)" "$dur"
-        record_result "clean-uv" "CLEAN" "UP TO DATE" "Cache optimal" "$dur"
+        record_result "clean-uv" "CLEAN" "UP TO DATE" "0 dangling files" "$dur"
       fi
     fi
   fi
@@ -1194,21 +1321,40 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
   if command -v npm &>/dev/null && should_run "clean-npm" "clean"; then
     log_card_start "NPM Cache & Debug Logs" "clean"
     t_start=$(date +%s%N)
-    log_step "Purging stale debug logs (~/.npm/_logs)..."
     log_count=$(find "$HOME/.npm/_logs" -type f 2>/dev/null | wc -l || echo 0)
-    [[ $log_count -gt 0 && "$MODE" != "check" ]] && rm -rf "$HOME/.npm/_logs/"* 2>/dev/null || true
-    log_step "Verifying cache integrity and garbage-collecting corrupted indices..."
-    if [[ "$MODE" == "check" ]]; then
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      log_card_end "UP TO DATE" "${log_count} debug logs present" "$dur"
-      record_result "clean-npm" "CLEAN" "UP TO DATE" "${log_count} logs" "$dur"
+    log_step "Scanning debug logs (~/.npm/_logs: ${log_count} files)..."
+    if [[ $DRY_RUN -eq 1 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "UP TO DATE" "${log_count} debug log(s) present" "$dur"
+      record_result "clean-npm" "CLEAN" "UP TO DATE" "${log_count} logs present" "$dur"
     else
-      npm cache verify &>/dev/null || true
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      log_card_end "CLEANED" "Purged ${log_count} log files & verified cache" "$dur"
-      record_result "clean-npm" "CLEAN" "CLEANED" "Purged ${log_count} logs" "$dur"
+      cleaned_npm=0
+      gc_info=""
+      if [[ $log_count -gt 0 ]]; then
+        rm -rf "$HOME/.npm/_logs/"* 2>/dev/null || true
+        cleaned_npm=1
+      fi
+      # Run expensive full-blob verification only on explicit clean, npm install activity, or cleared logs
+      if [[ "$FILTER_TYPE" == "clean" || $NPM_DID_UPDATE -eq 1 || $log_count -gt 0 ]]; then
+        log_step "Verifying cache integrity (npm cache verify)..."
+        npm_out=$(npm cache verify 2>&1 || true)
+        gc_count=$(printf '%s\n' "$npm_out" | awk -F: '/Content garbage-collected/ {print $2}' | awk '{print $1}')
+        gc_bytes=$(printf '%s\n' "$npm_out" | grep -i "Content garbage-collected" | grep -oE '\([0-9]+ bytes\)' | tr -d '() bytes' || true)
+        if [[ -n "$gc_count" && "$gc_count" -gt 0 ]]; then
+          cleaned_npm=1
+          gc_info=$(awk -v b="${gc_bytes:-0}" 'BEGIN {if (b>=1048576) printf "%.1fMB", b/1048576; else printf "%.0fKB", b/1024}')
+        fi
+      fi
+      dur="$(elapsed_since "$t_start")"
+      if [[ $cleaned_npm -eq 1 ]]; then
+        detail_msg="Purged ${log_count} log(s)${gc_info:+, GC ${gc_info}}"
+        short_msg="${log_count} log(s)${gc_info:+, GC ${gc_info}}"
+        log_card_end "CLEANED" "$detail_msg" "$dur"
+        record_result "clean-npm" "CLEAN" "CLEANED" "$short_msg" "$dur"
+      else
+        log_card_end "UP TO DATE" "0 stale logs; cache skipped (idle)" "$dur"
+        record_result "clean-npm" "CLEAN" "UP TO DATE" "Cache clean" "$dur"
+      fi
     fi
   fi
 
@@ -1216,24 +1362,23 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
   if command -v pip &>/dev/null && should_run "clean-pip" "clean"; then
     log_card_start "Python Pip Cache" "clean"
     t_start=$(date +%s%N)
-    log_step "Purging cached wheel downloads and HTTP index files..."
-    if [[ "$MODE" == "check" ]]; then
-      pip_sz=$(pip cache info 2>/dev/null | grep -i "cache size:" | awk -F: '{print $2}' | xargs || echo "0B")
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
+    if [[ $DRY_RUN -eq 1 ]]; then
+      pip_sz=$(pip cache info 2>/dev/null | awk -F: '/Package index page cache size/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
+      dur="$(elapsed_since "$t_start")"
       log_card_end "UP TO DATE" "Cache footprint: ${pip_sz:-0B}" "$dur"
-      record_result "clean-pip" "CLEAN" "UP TO DATE" "Cache: ${pip_sz:-0B}" "$dur"
+      record_result "clean-pip" "CLEAN" "UP TO DATE" "Footprint: ${pip_sz:-0B}" "$dur"
     else
+      log_step "Purging cached wheel downloads and HTTP index files..."
       pip_out=$(pip cache purge 2>&1 || true)
-      t_end=$(date +%s%N)
-      dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-      if echo "$pip_out" | grep -qi "Files removed"; then
-        freed=$(echo "$pip_out" | grep -oE "\([0-9.]+ [KMGT]?B\)" | tr -d '()' | head -n 1)
-        log_card_end "CLEANED" "Purged wheels & index files (${freed:-freed})" "$dur"
-        record_result "clean-pip" "CLEAN" "CLEANED" "Purged: ${freed:-freed}" "$dur"
+      dur="$(elapsed_since "$t_start")"
+      removed_files=$(printf '%s\n' "$pip_out" | sed -n 's/^Files removed: \([0-9]\+\).*/\1/p' | head -n 1)
+      removed_size=$(printf '%s\n' "$pip_out" | sed -n 's/^Files removed: [0-9]\+ (\([^)]*\)).*/\1/p' | head -n 1)
+      if [[ -n "$removed_files" && "$removed_files" -gt 0 ]]; then
+        log_card_end "CLEANED" "Purged ${removed_files} files (${removed_size:-0B})" "$dur"
+        record_result "clean-pip" "CLEAN" "CLEANED" "${removed_files} files (${removed_size:-0B})" "$dur"
       else
-        log_card_end "UP TO DATE" "Cache optimal" "$dur"
-        record_result "clean-pip" "CLEAN" "UP TO DATE" "Cache optimal" "$dur"
+        log_card_end "UP TO DATE" "Cache empty (0 files removed)" "$dur"
+        record_result "clean-pip" "CLEAN" "UP TO DATE" "0 files (empty)" "$dur"
       fi
     fi
   fi
@@ -1243,36 +1388,32 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
     log_card_start "Desktop Updater Packages & Temp Installers" "clean"
     t_start=$(date +%s%N)
     rpm_cache="$HOME/.cache/@opencode-aidesktop-updater/pending/opencode-desktop-linux-x86_64.rpm"
-    cleaned_installer=0
+    installer_status="UP TO DATE"
     installer_detail="No stale installers"
+    installer_short=""
+
     if [[ -f "$rpm_cache" ]] && command -v rpm &>/dev/null; then
       cached_v=$(rpm -qp "$rpm_cache" --queryformat "%{VERSION}" 2>/dev/null || true)
       curr_v=$(rpm -q --queryformat "%{VERSION}" opencode 2>/dev/null || true)
-      if [[ -n "$curr_v" && -n "$cached_v" && "$curr_v" == "$cached_v" ]]; then
-        sz=$(du -sh "$rpm_cache" 2>/dev/null | awk '{print $1}')
-        if [[ "$MODE" != "check" ]]; then
-          rm -rf "$HOME/.cache/@opencode-aidesktop-updater/pending"* 2>/dev/null || true
-          cleaned_installer=1
-          installer_detail="Removed installed RPM installer (${sz})"
+      sz=$(du -sh "$rpm_cache" 2>/dev/null | awk '{print $1}')
+      if [[ -n "$curr_v" && -n "$cached_v" ]] && ! is_version_gt "$cached_v" "$curr_v"; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+          installer_status="UPDATE AVAIL"
+          installer_detail="Reclaimable RPM (${sz})"
         else
-          installer_detail="Installed RPM cached (${sz})"
+          rm -rf "$HOME/.cache/@opencode-aidesktop-updater/pending"* 2>/dev/null || true
+          installer_status="CLEANED"
+          installer_detail="Removed installed RPM (${sz})"
         fi
       else
-        installer_detail="Retained pending update package (v${cached_v})"
+        installer_status="CACHED"
+        installer_detail="Pending v${cached_v:-RPM} kept (${sz})"
+        installer_short="Kept v${cached_v:-RPM} (${sz})"
       fi
     fi
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    if [[ $cleaned_installer -eq 1 ]]; then
-      log_card_end "CLEANED" "$installer_detail" "$dur"
-      record_result "clean-installers" "CLEAN" "CLEANED" "$installer_detail" "$dur"
-    elif [[ "$installer_detail" =~ Retained ]]; then
-      log_card_end "CACHED" "$installer_detail" "$dur"
-      record_result "clean-installers" "CLEAN" "CACHED" "Installer ready" "$dur"
-    else
-      log_card_end "UP TO DATE" "$installer_detail" "$dur"
-      record_result "clean-installers" "CLEAN" "UP TO DATE" "$installer_detail" "$dur"
-    fi
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "$installer_status" "$installer_detail" "$dur"
+    record_result "clean-installers" "CLEAN" "$installer_status" "${installer_short:-$installer_detail}" "$dur"
   fi
 
   # 22. Local AI Git Repositories (git gc --auto)
@@ -1280,21 +1421,34 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
     log_card_start "Local AI Git Repositories (git gc --auto)" "clean"
     t_start=$(date +%s%N)
     repos_checked=0
+    repos_packed=0
     for r in "$HOME/CoWork-OS" "$HOME/Orkas"; do
       if [[ -d "$r/.git" ]]; then
-        log_step "Optimizing repository packfiles in ${r}..."
-        [[ "$MODE" != "check" ]] && git -C "$r" gc --auto --quiet 2>/dev/null || true
-        ((repos_checked++))
+        ((repos_checked++)) || true
+        before_loose=$(git -C "$r" count-objects 2>/dev/null | awk '{print $1}')
+        if [[ $DRY_RUN -eq 0 ]]; then
+          log_step "Running git gc --auto in ${r} (loose: ${before_loose:-0})..."
+          git -C "$r" gc --auto --quiet 2>/dev/null || true
+          after_loose=$(git -C "$r" count-objects 2>/dev/null | awk '{print $1}')
+          if [[ -n "$before_loose" && -n "$after_loose" && "$after_loose" -lt "$before_loose" ]]; then
+            ((repos_packed++)) || true
+          fi
+        fi
       fi
     done
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    if [[ $repos_checked -gt 0 ]]; then
-      log_card_end "CLEANED" "Packed loose objects in ${repos_checked} repos" "$dur"
-      record_result "clean-git" "CLEAN" "CLEANED" "${repos_checked} repos optimized" "$dur"
+    dur="$(elapsed_since "$t_start")"
+    if [[ $repos_checked -eq 0 ]]; then
+      log_card_end "SKIPPED" "No tracked git repos found" "$dur"
+      record_result "clean-git" "CLEAN" "SKIPPED" "None found" "$dur"
+    elif [[ $DRY_RUN -eq 1 ]]; then
+      log_card_end "UP TO DATE" "Checked ${repos_checked} repo(s)" "$dur"
+      record_result "clean-git" "CLEAN" "UP TO DATE" "${repos_checked} checked" "$dur"
+    elif [[ $repos_packed -gt 0 ]]; then
+      log_card_end "CLEANED" "Packed objects in ${repos_packed}/${repos_checked} repo(s)" "$dur"
+      record_result "clean-git" "CLEAN" "CLEANED" "${repos_packed} repacked" "$dur"
     else
-      log_card_end "UP TO DATE" "No active local git repos" "$dur"
-      record_result "clean-git" "CLEAN" "UP TO DATE" "Optimal" "$dur"
+      log_card_end "UP TO DATE" "${repos_checked} repo(s) already packed" "$dur"
+      record_result "clean-git" "CLEAN" "UP TO DATE" "${repos_checked} packed" "$dur"
     fi
   fi
 
@@ -1302,49 +1456,65 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
   if [[ -d "$HOME/.cache/electron" ]] && should_run "clean-electron" "clean"; then
     log_card_start "Cached Electron Distribution Archives" "clean"
     t_start=$(date +%s%N)
-    log_step "Pruning cached distribution zips older than 7 days (~/.cache/electron)..."
+    log_step "Scanning cached distribution zips >7 days old (~/.cache/electron)..."
     old_zips=$(find "$HOME/.cache/electron" -type f -name "*.zip" -mtime +7 2>/dev/null | wc -l || echo 0)
-    if [[ $old_zips -gt 0 && "$MODE" != "check" ]]; then
+    if [[ $old_zips -gt 0 && $DRY_RUN -eq 0 ]]; then
+      old_sz=$(find "$HOME/.cache/electron" -type f -name "*.zip" -mtime +7 -exec du -cb {} + 2>/dev/null | tail -n 1 | awk '{printf "%.1fMB", $1/1048576}')
       find "$HOME/.cache/electron" -type f -name "*.zip" -mtime +7 -delete 2>/dev/null || true
       find "$HOME/.cache/electron" -type d -empty -delete 2>/dev/null || true
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "CLEANED" "Pruned ${old_zips} archive(s) (${old_sz:-pruned})" "$dur"
+      record_result "clean-electron" "CLEAN" "CLEANED" "${old_zips} (${old_sz})" "$dur"
+    else
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "UP TO DATE" "${old_zips} stale (>7d) archives" "$dur"
+      record_result "clean-electron" "CLEAN" "UP TO DATE" "${old_zips} stale" "$dur"
     fi
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    log_card_end "CLEANED" "Pruned ${old_zips} stale electron archives" "$dur"
-    record_result "clean-electron" "CLEAN" "CLEANED" "${old_zips} archives pruned" "$dur"
   fi
 
   # 24. System Package Manager Cache Debloat (DNF)
   if command -v dnf &>/dev/null && should_run "clean-dnf" "clean"; then
     log_card_start "System Package Cache (DNF)" "clean"
     t_start=$(date +%s%N)
-    log_step "Pruning downloaded package cache files..."
-    if [[ "$MODE" != "check" ]]; then
-      if sudo -n true 2>/dev/null; then
-        sudo dnf clean packages &>/dev/null || true
+    if [[ $DRY_RUN -eq 1 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "UP TO DATE" "System RPM cache check requires root" "$dur"
+      record_result "clean-dnf" "CLEAN" "UP TO DATE" "Needs root check" "$dur"
+    elif sudo -n true 2>/dev/null; then
+      log_step "Cleaning root DNF package cache (sudo dnf clean packages)..."
+      dnf_clean_out=$(sudo dnf clean packages 2>&1 || true)
+      dur="$(elapsed_since "$t_start")"
+      removed_rpm=$(printf '%s\n' "$dnf_clean_out" | sed -n 's/Removed \([0-9]\+\) files.*/\1/p' | head -n 1)
+      if [[ -n "$removed_rpm" && "$removed_rpm" -gt 0 ]]; then
+        log_card_end "CLEANED" "Removed ${removed_rpm} cached RPM files" "$dur"
+        record_result "clean-dnf" "CLEAN" "CLEANED" "${removed_rpm} RPMs purged" "$dur"
       else
-        dnf clean packages &>/dev/null || true
+        log_card_end "UP TO DATE" "DNF package cache empty" "$dur"
+        record_result "clean-dnf" "CLEAN" "UP TO DATE" "Cache empty" "$dur"
       fi
+    else
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "Requires active sudo for /var/cache/libdnf5" "$dur"
+      record_result "clean-dnf" "CLEAN" "SKIPPED" "Needs sudo" "$dur"
     fi
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    log_card_end "CLEANED" "DNF package cache pruned" "$dur"
-    record_result "clean-dnf" "CLEAN" "CLEANED" "Package cache pruned" "$dur"
   fi
 
-  # 25. Stale Crashpad Dumps & Temporary Sockets
+  # 25. Stale Crashpad Dumps
   if should_run "clean-dumps" "clean"; then
-    log_card_start "Stale Crash Dumps & Daemon Minidumps" "clean"
+    log_card_start "Stale Crash Dumps & Minidumps" "clean"
     t_start=$(date +%s%N)
-    log_step "Scanning for crashpad minidumps older than 7 days..."
+    log_step "Scanning for *.dmp crash dumps older than 7 days..."
     dmp_count=$(find "$HOME/.config" "$HOME/.cache" -type f -name "*.dmp" -mtime +7 2>/dev/null | wc -l || echo 0)
-    if [[ $dmp_count -gt 0 && "$MODE" != "check" ]]; then
+    if [[ $dmp_count -gt 0 && $DRY_RUN -eq 0 ]]; then
       find "$HOME/.config" "$HOME/.cache" -type f -name "*.dmp" -mtime +7 -delete 2>/dev/null || true
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "CLEANED" "Pruned ${dmp_count} stale crash dump(s)" "$dur"
+      record_result "clean-dumps" "CLEAN" "CLEANED" "${dmp_count} purged" "$dur"
+    else
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "UP TO DATE" "0 stale crash dumps (>7d)" "$dur"
+      record_result "clean-dumps" "CLEAN" "UP TO DATE" "0 stale dumps" "$dur"
     fi
-    t_end=$(date +%s%N)
-    dur=$(awk "BEGIN {printf \"%.1fs\", ($t_end - $t_start)/1000000000}")
-    log_card_end "CLEANED" "Pruned ${dmp_count} stale crash dumps" "$dur"
-    record_result "clean-dumps" "CLEAN" "CLEANED" "${dmp_count} dumps purged" "$dur"
   fi
 fi
 
@@ -1357,69 +1527,77 @@ count_avail=0
 count_cached=0
 count_cleaned=0
 count_skipped=0
+count_failed=0
 
-for s in "${REPORT_STATUS[@]}"; do
+for s in "${REPORT_STATUS[@]:-}"; do
+  [[ -z "$s" ]] && continue
   case "$s" in
-    UPDATED)           ((count_updated++)) ;;
-    CACHED)            ((count_cached++)) ;;
-    CLEANED|DEBLOATED) ((count_cleaned++)) ;;
-    "UP TO DATE")      ((count_uptodate++)) ;;
-    "UPDATE AVAIL")    ((count_avail++)) ;;
-    *)                 ((count_skipped++)) ;;
+    UPDATED)           ((count_updated++)) || true ;;
+    CACHED)            ((count_cached++)) || true ;;
+    CLEANED|DEBLOATED) ((count_cleaned++)) || true ;;
+    "UP TO DATE")      ((count_uptodate++)) || true ;;
+    "UPDATE AVAIL")    ((count_avail++)) || true ;;
+    FAILED)            ((count_failed++)) || true ;;
+    *)                 ((count_skipped++)) || true ;;
   esac
 done
 
 if [[ "$OUTPUT_FORMAT" == "json" ]]; then
-  python3 -c "
+  python3 -c '
 import json, sys
 
-sep = '__AIUP_SEP__'
-names = sys.argv[1].split(sep) if sys.argv[1] else []
-types = sys.argv[2].split(sep) if sys.argv[2] else []
-statuses = sys.argv[3].split(sep) if sys.argv[3] else []
-details = sys.argv[4].split(sep) if sys.argv[4] else []
-durations = sys.argv[5].split(sep) if sys.argv[5] else []
+sep = "__AIUP_SEP__"
+names = sys.argv[6].split(sep) if sys.argv[6] else []
+types = sys.argv[7].split(sep) if sys.argv[7] else []
+statuses = sys.argv[8].split(sep) if sys.argv[8] else []
+details = sys.argv[9].split(sep) if sys.argv[9] else []
+durations = sys.argv[10].split(sep) if sys.argv[10] else []
 
 results = []
 for n, t, s, d, dur in zip(names, types, statuses, details, durations):
     if n:
         results.append({
-            'target': n,
-            'scope': t,
-            'status': s,
-            'details': d,
-            'duration': dur
+            "target": n,
+            "scope": t,
+            "status": s,
+            "details": d,
+            "duration": dur,
         })
 
 summary = {
-    'version': '${VERSION}',
-    'os': '${OS}',
-    'pkg_manager': '${PKG_MGR}',
-    'mode': '${MODE}',
-    'counts': {
-        'total': len(results),
-        'up_to_date': ${count_uptodate},
-        'updated': ${count_updated},
-        'cleaned': ${count_cleaned},
-        'cached': ${count_cached},
-        'available': ${count_avail},
-        'skipped': ${count_skipped}
+    "version": sys.argv[1],
+    "os": sys.argv[2],
+    "arch": sys.argv[3],
+    "pkg_manager": sys.argv[4],
+    "mode": sys.argv[5],
+    "counts": {
+        "total": len(results),
+        "up_to_date": int(sys.argv[11]),
+        "updated": int(sys.argv[12]),
+        "cleaned": int(sys.argv[13]),
+        "cached": int(sys.argv[14]),
+        "available": int(sys.argv[15]),
+        "skipped": int(sys.argv[16]),
+        "failed": int(sys.argv[17]),
     },
-    'results': results
+    "results": results,
 }
 print(json.dumps(summary, indent=2))
-" \
-  "$(printf "%s__AIUP_SEP__" "${REPORT_NAMES[@]:-}")" \
-  "$(printf "%s__AIUP_SEP__" "${REPORT_TYPES[@]:-}")" \
-  "$(printf "%s__AIUP_SEP__" "${REPORT_STATUS[@]:-}")" \
-  "$(printf "%s__AIUP_SEP__" "${REPORT_DETAILS[@]:-}")" \
-  "$(printf "%s__AIUP_SEP__" "${REPORT_DURATIONS[@]:-}")"
+' \
+    "$VERSION" "$OS" "$ARCH" "$PKG_MGR" "$MODE_LABEL" \
+    "$(printf "%s__AIUP_SEP__" "${REPORT_NAMES[@]:-}")" \
+    "$(printf "%s__AIUP_SEP__" "${REPORT_TYPES[@]:-}")" \
+    "$(printf "%s__AIUP_SEP__" "${REPORT_STATUS[@]:-}")" \
+    "$(printf "%s__AIUP_SEP__" "${REPORT_DETAILS[@]:-}")" \
+    "$(printf "%s__AIUP_SEP__" "${REPORT_DURATIONS[@]:-}")" \
+    "$count_uptodate" "$count_updated" "$count_cleaned" "$count_cached" "$count_avail" "$count_skipped" "$count_failed"
+  [[ $count_failed -gt 0 ]] && exit 1
   exit 0
 fi
 
 # Text Mode Summary Dashboard
 echo -e "${BOLD}${CYAN}╭────────────────────────────────────────────────────────────────────────────────────────╮${RESET}"
-echo -e "${BOLD}${CYAN}│${RESET}  ${BOLD}📊 Update Summary Dashboard${RESET}                                                          ${BOLD}${CYAN}│${RESET}"
+echo -e "${BOLD}${CYAN}│${RESET}  ${BOLD}📊 Sync Summary Dashboard${RESET}                                                            ${BOLD}${CYAN}│${RESET}"
 echo -e "${BOLD}${CYAN}├─────────────────────┬────────────┬────────────────────┬────────────────────────┬───────┤${RESET}"
 printf "${BOLD}${CYAN}│${RESET} %-19s │ %-10s │ %-18s │ %-22s │ %-5s ${BOLD}${CYAN}│${RESET}\n" "Target" "Scope" "Status" "Details" "Time"
 echo -e "${BOLD}${CYAN}├─────────────────────┼────────────┼────────────────────┼────────────────────────┼───────┤${RESET}"
@@ -1432,38 +1610,15 @@ for i in "${!REPORT_NAMES[@]}"; do
   dur="${REPORT_DURATIONS[$i]}"
 
   case "$status" in
-    UPDATED)
-      status_badge="${GREEN}✔ UPDATED${RESET}"
-      status_plain="✔ UPDATED"
-      ;;
-    CLEANED|DEBLOATED)
-      status_badge="${GREEN}✔ CLEANED${RESET}"
-      status_plain="✔ CLEANED"
-      ;;
-    "UP TO DATE")
-      status_badge="${GREEN}✔ UP-TO-DATE${RESET}"
-      status_plain="✔ UP-TO-DATE"
-      ;;
-    "UPDATE AVAIL")
-      status_badge="${YELLOW}★ AVAILABLE${RESET}"
-      status_plain="★ AVAILABLE"
-      ;;
-    "DIRTY (SKIPPED)")
-      status_badge="${YELLOW}▲ DIRTY TREE${RESET}"
-      status_plain="▲ DIRTY TREE"
-      ;;
-    CACHED)
-      status_badge="${CYAN}⇣ CACHED${RESET}"
-      status_plain="⇣ CACHED"
-      ;;
-    SKIPPED)
-      status_badge="${GRAY}⊘ SKIPPED${RESET}"
-      status_plain="⊘ SKIPPED"
-      ;;
-    *)
-      status_badge="${CYAN}${status}${RESET}"
-      status_plain="${status}"
-      ;;
+    UPDATED)           status_badge="${GREEN}✔ UPDATED${RESET}";       status_plain="✔ UPDATED" ;;
+    CLEANED|DEBLOATED) status_badge="${GREEN}✔ CLEANED${RESET}";       status_plain="✔ CLEANED" ;;
+    "UP TO DATE")      status_badge="${GREEN}✔ UP-TO-DATE${RESET}";    status_plain="✔ UP-TO-DATE" ;;
+    "UPDATE AVAIL")    status_badge="${YELLOW}★ AVAILABLE${RESET}";    status_plain="★ AVAILABLE" ;;
+    "DIRTY (SKIPPED)") status_badge="${YELLOW}▲ DIRTY TREE${RESET}";   status_plain="▲ DIRTY TREE" ;;
+    CACHED)            status_badge="${CYAN}⇣ CACHED${RESET}";         status_plain="⇣ CACHED" ;;
+    FAILED)            status_badge="${RED}✖ FAILED${RESET}";          status_plain="✖ FAILED" ;;
+    SKIPPED)           status_badge="${GRAY}⊘ SKIPPED${RESET}";        status_plain="⊘ SKIPPED" ;;
+    *)                 status_badge="${CYAN}${status}${RESET}";        status_plain="${status}" ;;
   esac
 
   type_badge="${CYAN}${type}${RESET}"
@@ -1488,6 +1643,7 @@ summary_footer="  ${BOLD}Total:${RESET} ${#REPORT_NAMES[@]} items  │  ${GREEN}
 [[ $count_cached -gt 0 ]] && summary_footer+="  │  ${CYAN}${count_cached} cached${RESET}"
 [[ $count_avail -gt 0 ]] && summary_footer+="  │  ${YELLOW}${count_avail} available${RESET}"
 [[ $count_skipped -gt 0 ]] && summary_footer+="  │  ${GRAY}${count_skipped} skipped${RESET}"
+[[ $count_failed -gt 0 ]] && summary_footer+="  │  ${RED}${count_failed} failed${RESET}"
 echo -e "${summary_footer}\n"
 
 # Desktop Notification (if in active GUI session)
@@ -1495,7 +1651,11 @@ if command -v notify-send &>/dev/null && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}
   notify_msg="${count_uptodate} Up-to-date, ${count_updated} Updated"
   [[ $count_cleaned -gt 0 ]] && notify_msg+=", ${count_cleaned} Cleaned"
   [[ $count_avail -gt 0 ]] && notify_msg+=", ${count_avail} Available"
+  [[ $count_failed -gt 0 ]] && notify_msg+=", ${count_failed} Failed"
   notify-send -a "aiup" -i "dialog-information" "⚡ AIUP Sync Finished" "$notify_msg" 2>/dev/null || true
 elif [[ $IS_MACOS -eq 1 ]]; then
   osascript -e "display notification \"${count_uptodate} Up-to-date, ${count_updated} Updated, ${count_cleaned} Cleaned\" with title \"⚡ AIUP Sync Finished\"" 2>/dev/null || true
 fi
+
+[[ $count_failed -gt 0 ]] && exit 1
+exit 0

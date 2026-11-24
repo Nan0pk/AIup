@@ -1,165 +1,161 @@
 # ⚡ aiup (Universal AI Harness & Desktop App Updater)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)]()
-[![Shell](https://img.shields.io/badge/shell-bash%20%7C%20zsh-4EAA25.svg)]()
+[![Platform](https://img.shields.io/badge/platform-Fedora%20%7C%20Linux-lightgrey.svg)]()
+[![Shell](https://img.shields.io/badge/shell-bash-4EAA25.svg)]()
 
-> One unified command to detect, monitor, and synchronize all your AI CLIs, autonomous agents, and desktop AI workspaces.
+> Unified CLI + desktop updater and post-sync cache debloat utility tailored for local AI runtimes on Linux (primarily Fedora / DNF / RPM, with read-only inventory & cross-platform helpers).
 
 ```text
 ╭──────────────────────────────────────────────────────────────╮
-│  🚀 [UPDATE MODE] Syncing All AI Harnesses & Desktop Apps... │
+│  🚀 [UPDATE MODE] Syncing AI Harnesses & Desktop Apps...     │
 ╰──────────────────────────────────────────────────────────────╯
 
 ◈ [SECTION 1] CLI HARNESSES & CORE AGENTS
 
 ┌── ◈ [CLI] Claude Code (claude)
   │   ↳ Connecting to Anthropic update manifest...
-  │   ↳ Current version: 2.1.331
-  │   ↳ Checking for updates to latest version…
-  └── ✔ [UP-TO-DATE] Manifest verified [1.1s]
+  └── ✔ [UP-TO-DATE] Current (2.1.331) [1.1s]
 
 ❖ [SECTION 2] DESKTOP AI APPS & WORKSPACES
 
 ┌── ❖ [DESKTOP] ChatGPT Desktop App (chatgpt)
-  │   ↳ Checking official DNF repository (https://persistent.oaistatic.com/...)...
+  │   ↳ Checking official DNF repository (chatgpt.repo)...
   └── ✔ [UP-TO-DATE] Version 26.1120.41243 is current [0.5s]
 
 ┌── ❖ [DESKTOP] OpenCode Desktop App (opencode-desktop)
-  │   ↳ Inspecting local RPM package (v1.19.5)...
-  │   ↳ Querying GitHub releases (anomalyco/opencode)...
-  │   ↳ Found new release: v1.19.6 (local: v1.19.5)
-  └── ★ [UPDATE AVAILABLE] v1.19.5 → v1.19.6 [0.5s]
+  │   ↳ Querying OpenCode release manifest (latest-linux.yml)...
+  │   ↳ SHA-512 digest verified against latest-linux.yml
+  └── ✔ [UPDATED] Installed v1.19.6 [12.4s]
+
+🧹 [SECTION 3] HOUSEKEEPING & SYSTEM DEBLOAT
+
+┌── 🧹 [CLEANUP] Python uv Cache & Environments
+  └── ✔ [CLEANED] Pruned 449 files, 165.1MiB [0.1s]
 
 ╭────────────────────────────────────────────────────────────────────────────────────────╮
-│  📊 Update Summary Dashboard                                                          │
+│  📊 Sync Summary Dashboard                                                            │
 ├─────────────────────┬────────────┬────────────────────┬────────────────────────┬───────┤
 │ Target              │ Scope      │ Status             │ Details                │ Time  │
 ├─────────────────────┼────────────┼────────────────────┼────────────────────────┼───────┤
-│ claude              │ CLI        │ ✔ UP-TO-DATE       │ Verified               │ 1.1s  │
-│ codex               │ CLI        │ ✔ UP-TO-DATE       │ v0.172.0               │ 2.4s  │
+│ claude              │ CLI        │ ✔ UP-TO-DATE       │ 2.1.331                │ 1.1s  │
 │ chatgpt             │ DESKTOP    │ ✔ UP-TO-DATE       │ v26.1120.41243         │ 0.5s  │
-│ opencode-desktop    │ DESKTOP    │ ★ AVAILABLE        │ v1.19.6                │ 0.5s  │
-│ cowork-os           │ DESKTOP    │ ▲ DIRTY TREE       │ 4 edits                │ 0.0s  │
+│ opencode-desktop    │ DESKTOP    │ ✔ UPDATED          │ v1.19.6                │ 12.4s │
+│ clean-uv            │ CLEAN      │ ✔ CLEANED          │ 449 files, 165.1MiB    │ 0.1s  │
 ╰─────────────────────┴────────────┴────────────────────┴────────────────────────┴───────╯
-  Total: 5 items  │  3 up-to-date  │  0 updated  │  1 available  │  1 skipped
+  Total: 4 items  │  2 up-to-date  │  1 updated  │  1 cleaned
 ```
 
 ---
 
 ## ⚡ Quick Install
 
-Install `aiup` with a single command (no root privileges required):
+From a local clone:
+
+```bash
+./install.sh
+```
+
+Or remotely once published to GitHub:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Nan0pk/aiup/main/install.sh | bash
 ```
 
-This installs `aiup` and the short alias `uai` to `~/.local/bin/` with automatic shell autocompletion.
+Installs `aiup` and `uai` into `~/.local/bin/` along with Bash and Zsh autocompletion.
 
 ---
 
 ## 🎯 Supported Engines & Applications
 
 ### ◈ CLI Harnesses & Agents
-| Harness | Command | Engine / Source |
+| Harness | Target ID | Behavior |
 | :--- | :--- | :--- |
-| **Google Antigravity** | `agy` | Native Google Antigravity release channels |
-| **Claude Code** | `claude` | Anthropic binary updater manifest |
-| **OpenAI Codex** | `codex` | Standalone binary distribution via ChatGPT |
-| **Hermes Agent** | `hermes` | NousResearch git distribution & Python venv sync |
-| **OpenCode CLI** | `opencode` | Upstream OpenCode release packages |
-| **Xiaomi Mimocode** | `mimo` | Xiaomi Mimocode release endpoint |
-| **Kilo Agent** | `kilo` | Kilo agent distribution channels |
-| **Goose CLI** | `goose` | Block Goose CLI release binary |
-| **Python uv Tools** | `uv tool` | All `uv`-managed tools (e.g. `mistral-vibe`) |
-| **NPM Global AI Packages** | `npm` | `command-code`, `@qwen-code/qwen-code`, `cline` |
+| **Google Antigravity** | `agy` | Runs `agy update` (skips under `-c`, no native `--check`) |
+| **Claude Code** | `claude` | Runs `claude update` (skips under `-c`, no native `--check`) |
+| **OpenAI Codex** | `codex` | Runs `codex update`, diffs pre/post version (skips under `-c`) |
+| **OpenCode CLI** | `opencode` | Runs `opencode upgrade` (skips under `-c`) |
+| **Xiaomi Mimocode** | `mimo` | Runs `mimo upgrade` (skips under `-c`) |
+| **Kilo Agent** | `kilo` | Runs `kilo upgrade` (skips under `-c`) |
+| **Goose CLI** | `goose` | Runs `goose update` (skips under `-c`) |
+| **Hermes Agent** | `hermes` | Supports native `--check` (`hermes update --check`) and `--yes --no-gateway-restart` |
+| **Python uv Tools** | `uv-tools` | Checks PyPI JSON under `-c`; runs `uv tool upgrade --all` in update mode |
+| **NPM AI Globals** | `npm-globals` | Checks `npm view <pkg> version`, upgrades outdated non-symlinked globals (`command-code`, `@qwen-code/qwen-code`, `cline`) |
 
 ### ❖ Desktop AI Apps & Workspaces
-| Application | Platform / Package | Description |
+| Application | Target ID | Behavior |
 | :--- | :--- | :--- |
-| **ChatGPT Desktop** | RPM / DNF / macOS | Official OpenAI desktop application |
-| **OpenCode Desktop** | RPM / AppImage | OpenCode AI Desktop environment |
-| **AionUi Workspace** | Electron (`~/.local/opt`) | AionUi multi-agent AI workspace |
-| **Antigravity IDE** | Electron (`~/.local/share`) | Google Antigravity AI-first development IDE |
-| **CoWork-OS Desktop** | Electron (`~/CoWork-OS`) | Local AI super-app (with automatic rebuilds) |
-| **Orkas Desktop** | Electron (`~/Orkas`) | Multi-agent AI team desktop client |
-| **Hermes Desktop UI** | UI (`hermes desktop`) | Hermes desktop frontend |
+| **ChatGPT Desktop** | `chatgpt` | Checks `dnf check-update chatgpt` and upgrades via `sudo dnf` / `pkexec` (Fedora/DNF) |
+| **OpenCode Desktop** | `opencode-desktop` | Queries `latest-linux.yml`, verifies SHA-512 + `rpm -K --nosignature`, installs `x86_64` RPM via `sudo`/`pkexec` |
+| **AionUi Workspace** | `aionui` | Compares local `app.asar` vs GitHub releases and alerts on newer versions (`manual` download) |
+| **Antigravity IDE** | `antigravity-desktop` | Inspects local IDE shell version (`self-managed` internally) |
+| **CoWork-OS Desktop** | `cowork-os` | Protects dirty trees (optional `--force-git` stash/pop), pulls `origin/main`, runs `npm install && npm run build` |
+| **Orkas Desktop** | `orkas` | Protects dirty trees (optional `--force-git` stash/pop), pulls upstream, syncs `npm install` |
+| **Hermes Desktop UI** | `hermes-desktop` | Tracks availability alongside core `hermes` |
 
 ### 🧹 Housekeeping & System Debloat
-| Module | Target | Action |
+| Module | Target ID | Action |
 | :--- | :--- | :--- |
-| **Python uv Cache** | `clean-uv` | Prune dangling wheel builds & orphaned venvs |
-| **NPM Cache & Logs** | `clean-npm` | Verify cache integrity & purge stale debug logs |
-| **Python Pip Cache** | `clean-pip` | Purge cached wheel downloads & HTTP cache |
-| **Installer Packages** | `clean-installers` | Remove cached `.rpm` installers once updated |
-| **Git Housekeeping** | `clean-git` | Auto-pack loose objects & prune git reflogs |
-| **Electron Archives** | `clean-electron` | Prune stale `.zip` runtime downloads older than 7d |
-| **DNF Package Cache** | `clean-dnf` | Clean cached RPM packages and transaction headers |
-| **Crashpad Dumps** | `clean-dumps` | Purge minidump files older than 7d |
+| **Python uv Cache** | `clean-uv` | Prunes dangling wheels/venvs (`uv cache prune`); reports `UP TO DATE` when 0 removed |
+| **NPM Cache & Logs** | `clean-npm` | Purges `~/.npm/_logs/*`; runs `npm cache verify` after npm installs, purged logs, or `-C` |
+| **Python Pip Cache** | `clean-pip` | Runs `pip cache purge` when files > 0 exist |
+| **Installer Packages** | `clean-installers` | Removes cached OpenCode desktop RPM once installed version >= cached version |
+| **Git Housekeeping** | `clean-git` | Runs `git gc --auto` on local checkouts (`~/CoWork-OS`, `~/Orkas`), reporting only when objects pack |
+| **Electron Archives** | `clean-electron` | Prunes `~/.cache/electron/*.zip` older than 7 days |
+| **DNF Package Cache** | `clean-dnf` | Runs `sudo dnf clean packages` if sudo session is active (`SKIPPED` without root) |
+| **Crashpad Dumps** | `clean-dumps` | Deletes `*.dmp` files older than 7 days in `~/.config` and `~/.cache` |
 
 ---
 
 ## 🛠️ CLI Usage
 
 ```bash
-# Update everything (CLI engines + Desktop apps) with housekeeping debloat
+# Update everything (CLI + Desktop apps) followed by housekeeping
 aiup
-
-# Fast alias
 uai
 
-# Run housekeeping & cache debloat only (skip updates)
-aiup -C
-# or: aiup --clean
-
-# Fast update only, skipping post-update housekeeping
-aiup --no-clean
-
-# Pre-authenticate sudo upfront at startup for an uninterrupted batch
-aiup -S
-
-# Disable all sudo prompts (leaves privileged updates cached for later)
-aiup --no-sudo
-
-# Dry-run check for updates without modifying files
+# Non-mutating check (scans versions, PyPI/npm/DNF/GitHub, and cache sizes without changes)
 aiup -c
 
-# Clean visual inventory of all installed versions
-aiup -l
+# Housekeeping & cache debloat only
+aiup -C
+aiup -c -C             # Dry-run housekeeping scan (safe regardless of flag order)
 
-# Only update desktop AI applications
-aiup --desktop
+# Fast update skipping housekeeping
+aiup --no-clean
 
-# Only update CLI harnesses
-aiup --cli
+# Sudo handling
+aiup -S                # Pre-authenticate sudo upfront (if safe) for unattended sync
+aiup --no-sudo         # Never prompt for sudo/pkexec (caches pending RPMs)
 
-# Update specific targets only
-aiup -o chatgpt,claude,codex
-
-# Skip specific targets
-aiup -s cowork-os
-
-# Stash and update git checkouts even if working tree is dirty
-aiup --force-git
-
-# Output structured JSON for automation / CI scripts
-aiup -c --json
+# Inventory & targeted execution
+aiup -l                # Dashboard of detected versions
+aiup -l --json         # JSON inventory
+aiup --desktop         # Desktop targets only
+aiup -o chatgpt,claude # Run specific targets only
+aiup -s cowork-os      # Skip specific targets
+aiup --force-git       # Stash uncommitted git changes, pull/build, then pop stash
 ```
 
 ---
 
 ## 🛡️ Safety & Architecture
 
-- **Automated Housekeeping & Debloat**: Cleans temporary updater artifacts (e.g. downloaded `.rpm` packages once installed), prunes dangling `uv` wheel builds, purges `pip` caches, removes stale `~/.npm/_logs`, and auto-optimizes local AI git repositories (`git gc`).
-- **Intelligent Privilege Elevation**: Sudo authentication can occur upfront at the start of a run (if privileged desktop apps are scheduled) or just-in-time when an update requires root (`rpm -U`, `dnf upgrade`). An active keep-alive prevents credential timeouts during long downloads. In dry-run (`-c`), inventory list (`-l`), or CLI-only scopes, root authorization is never requested.
-- **Working Tree Preservation**: Detects uncommitted changes in local git checkouts (`~/CoWork-OS`, `~/Orkas`) and skips auto-pulls by default to protect in-flight development work.
-- **NPM Symlink Protection**: Updates global packages individually without breaking local `npm link` references (such as symlinked local AI repos).
-- **Graceful Failure Isolation**: Each harness runs in an isolated sub-process. Upstream network failures or temporary auth challenges in one tool never block updating the rest of your stack.
-- **Desktop Notifications**: Dispatches native notifications (`notify-send` on Linux, `osascript` on macOS) when synchronization completes.
+- **Non-Mutating Dry-Run (`-c`)**: Self-updater CLIs lacking `--check` are explicitly skipped during `-c` rather than run silently; git workspaces use read-only `ls-remote`; npm/PyPI/DNF/GitHub checks never modify files.
+- **Cryptographic Package Verification**: Downloads for OpenCode Desktop verify SHA-512 against upstream `latest-linux.yml` plus `rpm -K --nosignature` before elevating to `rpm -U`.
+- **Just-in-Time or Upfront Sudo**: Prompts for `sudo` only when a verified update needs root (`-S` opts into safe startup pre-auth with keep-alive cleanup). Uses `pkexec` automatically when invoked headless under Wayland/X11.
+- **Honest Failure & Time Reporting**: Drains piped output cleanly (no `SIGPIPE` aborts), checks real exit codes, records elapsed durations after actual downloads/builds finish, and exits `1` when any step reports `FAILED`.
+
+---
+
+## 🧪 Tests
+
+```bash
+./tests/smoke.sh
+```
 
 ---
 
 ## 📄 License
 
-MIT © [Nan0pk](https://github.com/Nan0pk)
+MIT © [Nan0pk](https://github.com/Nan0pk) — see [`LICENSE`](LICENSE).
