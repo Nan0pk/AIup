@@ -310,6 +310,41 @@ stream_progress() {
   done
 }
 
+run_privileged() {
+  local prompt_desc="${1:-system update}"
+  shift || true
+
+  # 1. Non-interactive or already authenticated sudo session
+  if sudo -n true 2>/dev/null; then
+    sudo "$@"
+    return $?
+  fi
+
+  # Skip interactive prompts if explicitly marked non-interactive
+  if [[ "${CI:-}" == "true" || "${DEBIAN_FRONTEND:-}" == "noninteractive" || "${AIUP_NONINTERACTIVE:-}" == "1" ]]; then
+    return 2
+  fi
+
+  # 2. Interactive terminal (stdin is a TTY)
+  if [[ -t 0 ]]; then
+    log_step "Administrator privileges required for ${prompt_desc}"
+    if sudo -v </dev/tty >/dev/tty 2>&1; then
+      sudo "$@"
+      return $?
+    fi
+    return 1
+  fi
+
+  # 3. Graphical desktop session with Polkit pkexec
+  if [[ (-n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}") ]] && command -v pkexec &>/dev/null; then
+    log_step "Requesting desktop authorization via pkexec (${prompt_desc})..."
+    pkexec "$@"
+    return $?
+  fi
+
+  return 2
+}
+
 get_asar_version() {
   local asar_path="$1"
   if [[ ! -f "$asar_path" ]]; then
@@ -789,17 +824,11 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "desktop" ]]; then
           log_card_end "UPDATE AVAIL" "${curr_v} → ${avail_v:-latest}" "$dur"
           record_result "chatgpt" "DESKTOP" "UPDATE AVAIL" "${avail_v:-latest}" "$dur"
         else
-          log_step "Attempting DNF upgrade ('sudo dnf upgrade -y chatgpt')..."
-          if sudo -n true 2>/dev/null; then
-            sudo dnf upgrade -y chatgpt 2>&1 | stream_progress 4 || true
-            log_card_end "UPDATED" "Upgraded via DNF" "$dur"
-            record_result "chatgpt" "DESKTOP" "UPDATED" "Upgraded" "$dur"
-          elif [[ -t 0 ]]; then
-            sudo dnf upgrade -y chatgpt 2>&1 | stream_progress 4 || true
+          log_step "Attempting DNF upgrade for ChatGPT Desktop..."
+          if run_privileged "ChatGPT Desktop upgrade" dnf upgrade -y chatgpt 2>&1 | stream_progress 4; then
             log_card_end "UPDATED" "Upgraded via DNF" "$dur"
             record_result "chatgpt" "DESKTOP" "UPDATED" "Upgraded" "$dur"
           else
-            log_step "Notice: Sudo authentication required for DNF transaction"
             log_card_end "UPDATE AVAIL" "Run: sudo dnf upgrade -y chatgpt" "$dur"
             record_result "chatgpt" "DESKTOP" "UPDATE AVAIL" "sudo dnf upgrade" "$dur"
           fi
@@ -836,14 +865,35 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "desktop" ]]; then
         rpm_cache="${HOME}/.cache/@opencode-aidesktop-updater/pending/opencode-desktop-linux-x86_64.rpm"
         mkdir -p "$(dirname "$rpm_cache")"
         rpm_url="https://github.com/anomalyco/opencode/releases/download/v${latest_tag}/opencode-desktop-linux-x86_64.rpm"
-        log_step "Downloading RPM package from ${rpm_url}..."
-        if curl -fL --connect-timeout 5 -o "$rpm_cache" "$rpm_url" 2>&1 | stream_progress 2; then
-          log_step "Package cached at ${rpm_cache}"
-          if sudo -n true 2>/dev/null; then
-            sudo rpm -U "$rpm_cache" &>/dev/null && log_step "Installed RPM package" || true
+
+        need_download=1
+        if [[ -f "$rpm_cache" ]] && command -v rpm &>/dev/null; then
+          cached_v=$(rpm -qp "$rpm_cache" --queryformat "%{VERSION}" 2>/dev/null || true)
+          if [[ "$cached_v" == "$latest_tag" ]]; then
+            log_step "Verified ready cached RPM package (v${cached_v}) at ${rpm_cache}"
+            need_download=0
+          fi
+        fi
+
+        download_ok=0
+        if [[ $need_download -eq 0 ]]; then
+          download_ok=1
+        else
+          log_step "Downloading RPM package from ${rpm_url}..."
+          if curl -fL --connect-timeout 5 -o "$rpm_cache" "$rpm_url" 2>&1 | stream_progress 2; then
+            log_step "Package cached at ${rpm_cache}"
+            download_ok=1
+          fi
+        fi
+
+        if [[ $download_ok -eq 1 ]]; then
+          log_step "Installing RPM package (v${latest_tag})..."
+          if run_privileged "OpenCode Desktop RPM installation" rpm -U "$rpm_cache" 2>&1 | stream_progress 4; then
+            log_step "Installed RPM package successfully"
             log_card_end "UPDATED" "Installed v${latest_tag}" "$dur"
             record_result "opencode-desktop" "DESKTOP" "UPDATED" "v${latest_tag}" "$dur"
           else
+            log_step "Privileged installation not completed"
             log_card_end "CACHED" "Run: sudo rpm -U ${rpm_cache}" "$dur"
             record_result "opencode-desktop" "DESKTOP" "CACHED" "RPM ready" "$dur"
           fi
@@ -999,11 +1049,13 @@ fi
 count_updated=0
 count_uptodate=0
 count_avail=0
+count_cached=0
 count_skipped=0
 
 for s in "${REPORT_STATUS[@]}"; do
   case "$s" in
-    UPDATED|CACHED) ((count_updated++)) ;;
+    UPDATED)         ((count_updated++)) ;;
+    CACHED)          ((count_cached++)) ;;
     "UP TO DATE")    ((count_uptodate++)) ;;
     "UPDATE AVAIL")  ((count_avail++)) ;;
     *)               ((count_skipped++)) ;;
@@ -1041,6 +1093,7 @@ summary = {
         'total': len(results),
         'up_to_date': ${count_uptodate},
         'updated': ${count_updated},
+        'cached': ${count_cached},
         'available': ${count_avail},
         'skipped': ${count_skipped}
     },
@@ -1117,7 +1170,11 @@ for i in "${!REPORT_NAMES[@]}"; do
 done
 
 echo -e "${BOLD}${CYAN}╰─────────────────────┴────────────┴────────────────────┴────────────────────────┴───────╯${RESET}"
-echo -e "  ${BOLD}Total:${RESET} ${#REPORT_NAMES[@]} items  │  ${GREEN}${count_uptodate} up-to-date${RESET}  │  ${GREEN}${count_updated} updated${RESET}  │  ${YELLOW}${count_avail} available${RESET}  │  ${GRAY}${count_skipped} skipped${RESET}\n"
+if [[ $count_cached -gt 0 ]]; then
+  echo -e "  ${BOLD}Total:${RESET} ${#REPORT_NAMES[@]} items  │  ${GREEN}${count_uptodate} up-to-date${RESET}  │  ${GREEN}${count_updated} updated${RESET}  │  ${CYAN}${count_cached} cached${RESET}  │  ${YELLOW}${count_avail} available${RESET}  │  ${GRAY}${count_skipped} skipped${RESET}\n"
+else
+  echo -e "  ${BOLD}Total:${RESET} ${#REPORT_NAMES[@]} items  │  ${GREEN}${count_uptodate} up-to-date${RESET}  │  ${GREEN}${count_updated} updated${RESET}  │  ${YELLOW}${count_avail} available${RESET}  │  ${GRAY}${count_skipped} skipped${RESET}\n"
+fi
 
 # Desktop Notification (if in active GUI session)
 if command -v notify-send &>/dev/null && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
