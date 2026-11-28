@@ -7,19 +7,37 @@
 
 set -uo pipefail
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 
-# Detect Operating System & Architecture
-OS="$(uname -s)"
+# Detect Operating System & Architecture (preserve Windows $env:OS for child processes)
+HOST_OS="$(uname -s)"
 ARCH="$(uname -m)"
-case "$OS" in
-  Linux*)  IS_LINUX=1; IS_MACOS=0 ;;
-  Darwin*) IS_LINUX=0; IS_MACOS=1 ;;
-  *)       IS_LINUX=0; IS_MACOS=0 ;;
+IS_LINUX=0
+IS_MACOS=0
+IS_WINDOWS=0
+
+case "$HOST_OS" in
+  Linux*)  IS_LINUX=1 ;;
+  Darwin*) IS_MACOS=1 ;;
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+  *)
+    if [[ "${OS:-}" == "Windows_NT" || -n "${WINDIR:-}" ]]; then
+      IS_WINDOWS=1
+    fi
+    ;;
 esac
+
+if [[ $IS_WINDOWS -eq 1 ]]; then
+  export PYTHONIOENCODING="utf-8"
+  export PYTHONUTF8="1"
+fi
 
 # Detect Package Manager
 PKG_MGR="unknown"
+HAS_WINGET=0
+HAS_CHOCO=0
+HAS_SCOOP=0
+
 if [[ $IS_LINUX -eq 1 ]]; then
   if command -v dnf &>/dev/null; then
     PKG_MGR="dnf"
@@ -31,7 +49,18 @@ if [[ $IS_LINUX -eq 1 ]]; then
     PKG_MGR="zypper"
   fi
 elif [[ $IS_MACOS -eq 1 ]]; then
-  PKG_MGR="brew"
+  command -v brew &>/dev/null && PKG_MGR="brew"
+elif [[ $IS_WINDOWS -eq 1 ]]; then
+  command -v winget.exe &>/dev/null && HAS_WINGET=1
+  command -v choco.exe &>/dev/null && HAS_CHOCO=1
+  command -v scoop &>/dev/null && HAS_SCOOP=1
+  if [[ $HAS_WINGET -eq 1 ]]; then
+    PKG_MGR="winget"
+  elif [[ $HAS_SCOOP -eq 1 ]]; then
+    PKG_MGR="scoop"
+  elif [[ $HAS_CHOCO -eq 1 ]]; then
+    PKG_MGR="choco"
+  fi
 fi
 
 # Determine color support early across ALL arguments
@@ -91,6 +120,7 @@ NPM_DID_UPDATE=0
 SUDO_KEEP_ALIVE_PID=""
 declare -a ONLY_TARGETS=()
 declare -a SKIP_TARGETS=()
+declare -a PYTHON_CMD=()
 
 cleanup_on_exit() {
   if [[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]]; then
@@ -98,6 +128,183 @@ cleanup_on_exit() {
   fi
 }
 trap cleanup_on_exit EXIT
+
+# ==============================================================================
+# CROSS-PLATFORM PATH & RUNTIME HELPERS
+# ==============================================================================
+to_posix_path() {
+  local p="$1"
+  [[ -z "$p" ]] && return 0
+  if [[ $IS_WINDOWS -eq 1 ]] && command -v cygpath &>/dev/null; then
+    cygpath -u "$p" 2>/dev/null || printf '%s\n' "$p"
+  else
+    printf '%s\n' "$p"
+  fi
+}
+
+to_native_path() {
+  local p="$1"
+  [[ -z "$p" ]] && return 0
+  if [[ $IS_WINDOWS -eq 1 ]] && command -v cygpath &>/dev/null; then
+    cygpath -w "$p" 2>/dev/null || printf '%s\n' "$p"
+  else
+    printf '%s\n' "$p"
+  fi
+}
+
+LOCALAPPDATA_DIR=""
+APPDATA_DIR=""
+PROGRAMFILES_DIR=""
+PROGRAMFILES_X86_DIR=""
+
+if [[ $IS_WINDOWS -eq 1 ]]; then
+  LOCALAPPDATA_DIR="$(to_posix_path "${LOCALAPPDATA:-${USERPROFILE:-$HOME}/AppData/Local}")"
+  APPDATA_DIR="$(to_posix_path "${APPDATA:-${USERPROFILE:-$HOME}/AppData/Roaming}")"
+  PROGRAMFILES_DIR="$(to_posix_path "${PROGRAMFILES:-/c/Program Files}")"
+  _pf86="$(printenv 'ProgramFiles(x86)' 2>/dev/null || echo '')"
+  PROGRAMFILES_X86_DIR="$(to_posix_path "${_pf86:-/c/Program Files (x86)}")"
+  unset _pf86
+fi
+
+detect_python() {
+  local cand
+  local -a py_order=("python3" "python")
+  if [[ $IS_WINDOWS -eq 1 ]]; then
+    # On Windows, prefer `python` (real install ahead on PATH) over Microsoft Store/Manager `python3` shim
+    py_order=("python" "python3")
+  fi
+  for cand in "${py_order[@]}"; do
+    if command -v "$cand" &>/dev/null && "$cand" -c "import re, sys" &>/dev/null; then
+      PYTHON_CMD=("$cand")
+      return 0
+    fi
+  done
+  if [[ $IS_WINDOWS -eq 1 ]]; then
+    if command -v py &>/dev/null && py -3 -c "import re, sys" &>/dev/null; then
+      PYTHON_CMD=("py" "-3")
+      return 0
+    fi
+    local p
+    for p in /c/Python3*/python.exe "${LOCALAPPDATA_DIR:-}/Programs/Python/Python3"*/python.exe; do
+      if [[ -f "$p" ]] && "$p" -c "import re, sys" &>/dev/null; then
+        PYTHON_CMD=("$p")
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+run_py() {
+  if [[ ${#PYTHON_CMD[@]} -eq 0 ]]; then
+    detect_python || return 1
+  fi
+  "${PYTHON_CMD[@]}" "$@"
+}
+
+# Initialize Python early when present
+detect_python || true
+
+strip_cr() {
+  tr -d '\r'
+}
+
+json_get_file() {
+  local file_path="$1"
+  local expr="$2"
+  [[ -f "$file_path" ]] || return 1
+  if command -v jq &>/dev/null; then
+    jq -r "$expr" "$file_path" 2>/dev/null | strip_cr
+    return $?
+  fi
+  local native_path
+  native_path="$(to_native_path "$file_path")"
+  run_py -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        data = json.load(f)
+    val = data
+    for key in sys.argv[2].split("."):
+        if not key:
+            continue
+        if isinstance(val, dict):
+            val = val.get(key)
+        else:
+            val = None
+            break
+    if val is not None:
+        print(val)
+except Exception:
+    pass
+' "$native_path" "$expr" 2>/dev/null
+}
+
+json_get_stdin() {
+  local key="$1"
+  if command -v jq &>/dev/null; then
+    jq -r ".${key} // empty" 2>/dev/null | strip_cr
+    return $?
+  fi
+  run_py -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    val = data
+    for part in sys.argv[1].split("."):
+        if not part:
+            continue
+        val = val.get(part) if isinstance(val, dict) else None
+    if val is not None:
+        print(val)
+except Exception:
+    pass
+' "$key" 2>/dev/null
+}
+
+resolve_bin() {
+  local name="$1"
+  local found=""
+  if found="$(command -v "$name" 2>/dev/null)" && [[ -n "$found" ]]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+
+  local -a cands=()
+  case "$name" in
+    agy)
+      cands=("${HOME}/.local/bin/agy" "${LOCALAPPDATA_DIR:-}/agy/bin/agy.exe") ;;
+    claude)
+      cands=("${HOME}/.local/bin/claude" "${HOME}/.local/bin/claude.exe" "${LOCALAPPDATA_DIR:-}/Programs/claude/claude.exe") ;;
+    codex)
+      cands=("${LOCALAPPDATA_DIR:-}/Programs/OpenAI/Codex/bin/codex.exe" "${LOCALAPPDATA_DIR:-}/OpenAI/Codex/bin/codex.exe" "${HOME}/.local/bin/codex") ;;
+    hermes)
+      cands=("${HOME}/.local/bin/hermes" "${LOCALAPPDATA_DIR:-}/hermes/bin/hermes.exe") ;;
+    opencode)
+      cands=("${HOME}/.opencode/bin/opencode" "${HOME}/.opencode/bin/opencode.exe" "${HOME}/.local/bin/opencode" "${LOCALAPPDATA_DIR:-}/Programs/opencode/opencode.exe") ;;
+    uv)
+      cands=("${HOME}/.local/bin/uv" "${HOME}/.local/bin/uv.exe" "${HOME}/.cargo/bin/uv" "${HOME}/.cargo/bin/uv.exe" "${LOCALAPPDATA_DIR:-}/hermes/bin/uv.exe") ;;
+    ollama)
+      cands=("/usr/local/bin/ollama" "${LOCALAPPDATA_DIR:-}/Programs/Ollama/ollama.exe" "${PROGRAMFILES_DIR:-}/Ollama/ollama.exe") ;;
+    lms)
+      cands=("${HOME}/.lmstudio/bin/lms" "${HOME}/.lmstudio/bin/lms.exe" "${HOME}/.cache/lm-studio/bin/lms") ;;
+    copilot)
+      cands=("${HOME}/.local/bin/copilot" "${HOME}/.local/bin/copilot.exe") ;;
+    *)
+      cands=("${HOME}/.local/bin/${name}" "${HOME}/.local/bin/${name}.exe") ;;
+  esac
+
+  local p
+  for p in "${cands[@]}"; do
+    if [[ -n "$p" && -f "$p" ]]; then
+      if [[ $IS_WINDOWS -eq 1 && "$p" == *.exe ]] || [[ -x "$p" ]]; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
 
 usage() {
   echo -e "${BOLD}${CYAN}╭──────────────────────────────────────────────────────────────╮${RESET}"
@@ -117,7 +324,7 @@ usage() {
   echo -e "    ${CYAN}-C, --clean${RESET}           Run housekeeping, cache purge & debloat scope only"
   echo -e "    ${CYAN}--no-clean${RESET}            Skip post-update housekeeping and cache debloat"
   echo -e "    ${CYAN}-S, --sudo${RESET}            Pre-authenticate sudo at startup (if safe) for unattended sync"
-  echo -e "    ${CYAN}--no-sudo${RESET}             Disable sudo/pkexec prompts (cache privileged updates)"
+  echo -e "    ${CYAN}--no-sudo${RESET}             Disable elevation prompts (skip/cache privileged updates)"
   echo -e "    ${CYAN}--cli${RESET}                 Only target CLI harnesses and agent runtimes"
   echo -e "    ${CYAN}--desktop${RESET}             Only target Desktop AI apps and UI workspaces"
   echo -e "    ${CYAN}-o, --only <names>${RESET}    Only run specified targets (comma-separated)"
@@ -127,8 +334,8 @@ usage() {
   echo -e "    ${CYAN}--no-color${RESET}            Disable colored terminal output"
   echo ""
   echo -e "${BOLD}SUPPORTED TARGETS:${RESET}"
-  echo -e "  ${CYAN}◈ CLI Engines:${RESET}     agy, claude, codex, hermes, opencode, mimo, kilo, goose, uv-tools, npm-globals"
-  echo -e "  ${MAGENTA}❖ Desktop Apps:${RESET}    chatgpt, opencode-desktop, aionui, antigravity-desktop, cowork-os, orkas, hermes-desktop"
+  echo -e "  ${CYAN}◈ CLI Engines:${RESET}     agy, claude, codex, hermes, opencode, mimo, kilo, goose, uv-tools, pip-ai, npm-globals, ollama, lms"
+  echo -e "  ${MAGENTA}❖ Desktop Apps:${RESET}    chatgpt, opencode-desktop, aionui, antigravity-desktop, zcode, copilot, claude-desktop, codex-desktop, cowork-os, orkas, hermes-desktop"
   echo -e "  ${BLUE}🧹 Housekeeping:${RESET}   clean-uv, clean-npm, clean-pip, clean-installers, clean-git, clean-electron, clean-dnf, clean-dumps"
   echo ""
   echo -e "${BOLD}EXAMPLES:${RESET}"
@@ -160,7 +367,7 @@ while [[ $# -gt 0 ]]; do
       usage
       ;;
     -v|--version)
-      echo "aiup version ${VERSION} (${OS} ${ARCH})"
+      echo "aiup version ${VERSION} (${HOST_OS} ${ARCH})"
       exit 0
       ;;
     -l|--list)
@@ -279,10 +486,22 @@ should_run() {
   return 0
 }
 
+now_ns() {
+  local t
+  t="$(date +%s%N 2>/dev/null || true)"
+  if [[ "$t" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$t"
+  elif run_py -c 'import time; print(int(time.time() * 1_000_000_000))' 2>/dev/null; then
+    return 0
+  else
+    printf '%s000000000\n' "$(date +%s)"
+  fi
+}
+
 elapsed_since() {
   local t_start="$1"
   local t_end
-  t_end=$(date +%s%N)
+  t_end="$(now_ns)"
   awk -v s="$t_start" -v e="$t_end" 'BEGIN {printf "%.1fs", (e - s)/1000000000}'
 }
 
@@ -345,14 +564,14 @@ log_card_end() {
 stream_progress() {
   local max_lines="${1:-6}"
   local count=0
-  local esc_strip=$'s/\x1B\\[[0-9;]*[a-zA-Z]//g'
+  local esc_strip=$'s/\x1B\\[[0-9;?]*[a-zA-Z]//g'
   while IFS= read -r line; do
     if [[ "$OUTPUT_FORMAT" == "json" ]] || [[ $count -ge $max_lines ]]; then
       continue
     fi
     line="$(printf '%s' "$line" | tr '\r' '\n' | tail -n 1 | sed -E "$esc_strip" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ -z "$line" ]] && continue
-    if [[ "$line" =~ ^[═─━_=-]{3,}$ ]] || [[ "$line" =~ ^[█░▒◒◐◓◑]+$ ]]; then
+    if [[ "$line" =~ ^[═─━_=-]{3,}$ ]] || [[ "$line" =~ ^[█░▒◒◐◓◑\\|/-]+$ ]]; then
       continue
     fi
     if [[ ${#line} -gt 74 ]]; then
@@ -366,7 +585,15 @@ stream_progress() {
 is_version_gt() {
   local candidate="$1"
   local current="$2"
-  python3 -c '
+  local py=""
+  if command -v python3 &>/dev/null && python3 -c "import re, sys" &>/dev/null; then
+    py="python3"
+  elif command -v python &>/dev/null && python -c "import re, sys" &>/dev/null; then
+    py="python"
+  else
+    return 1
+  fi
+  "$py" -c '
 import re, sys
 
 def norm(s):
@@ -384,7 +611,18 @@ sys.exit(0 if c > l else 1)
 verify_sha512_b64() {
   local file_path="$1"
   local expected_b64="$2"
-  python3 -c '
+  local py=""
+  if command -v python3 &>/dev/null && python3 -c "import re, sys" &>/dev/null; then
+    py="python3"
+  elif command -v python &>/dev/null && python -c "import re, sys" &>/dev/null; then
+    py="python"
+  else
+    return 1
+  fi
+  if command -v cygpath &>/dev/null; then
+    file_path="$(cygpath -w "$file_path" 2>/dev/null || printf '%s' "$file_path")"
+  fi
+  "$py" -c '
 import base64, hashlib, sys
 h = hashlib.sha512()
 with open(sys.argv[1], "rb") as f:
@@ -395,7 +633,170 @@ sys.exit(0 if actual == sys.argv[2].strip() else 1)
 ' "$file_path" "$expected_b64" 2>/dev/null
 }
 
+verify_sha256_hex() {
+  local file_path="$1"
+  local expected_hex="$2"
+  local native_path
+  native_path="$(to_native_path "$file_path")"
+  run_py -c '
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as f:
+    for chunk in iter(lambda: f.read(1048576), b""):
+        h.update(chunk)
+sys.exit(0 if h.hexdigest().lower() == sys.argv[2].strip().lower() else 1)
+' "$native_path" "$expected_hex" 2>/dev/null
+}
+
+dir_size_human() {
+  local dir_path="$1"
+  [[ -d "$dir_path" ]] || { echo "0B"; return 0; }
+  if [[ $IS_WINDOWS -eq 1 ]]; then
+    local native_path
+    native_path="$(to_native_path "$dir_path")"
+    run_py -c '
+import os, sys
+total = 0
+stack = [sys.argv[1]]
+while stack:
+    d = stack.pop()
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    elif e.is_file(follow_symlinks=False):
+                        total += e.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+units = [("G", 1073741824), ("M", 1048576), ("K", 1024)]
+for suffix, div in units:
+    if total >= div:
+        print(f"{total / div:.1f}{suffix}")
+        sys.exit(0)
+print(f"{total}B")
+' "$native_path" 2>/dev/null || echo "0B"
+  else
+    du -sh "$dir_path" 2>/dev/null | awk '{print $1}' || echo "0B"
+  fi
+}
+
+count_files_in_dir() {
+  local dir_path="$1"
+  [[ -d "$dir_path" ]] || { echo "0"; return 0; }
+  if [[ $IS_WINDOWS -eq 1 ]]; then
+    local native_path
+    native_path="$(to_native_path "$dir_path")"
+    run_py -c '
+import os, sys
+c = 0
+stack = [sys.argv[1]]
+while stack:
+    d = stack.pop()
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    c += 1
+    except OSError:
+        pass
+print(c)
+' "$native_path" 2>/dev/null || echo "0"
+  else
+    { find "$dir_path" -type f 2>/dev/null || true; } | wc -l | awk '{print $1}'
+  fi
+}
+
+scan_or_prune_old_files() {
+  # Usage: scan_or_prune_old_files <mode: scan|prune> <pattern> <days> <dir1> [dir2 ...]
+  # Outputs: "<count> <human_size>"
+  local mode="$1"
+  local pattern="$2"
+  local days="$3"
+  shift 3
+
+  local -a existing=()
+  local d
+  for d in "$@"; do
+    [[ -d "$d" ]] && existing+=("$d")
+  done
+  if [[ ${#existing[@]} -eq 0 ]]; then
+    echo "0 0B"
+    return 0
+  fi
+
+  if [[ $IS_WINDOWS -eq 1 ]]; then
+    local -a native_dirs=()
+    for d in "${existing[@]}"; do
+      native_dirs+=("$(to_native_path "$d")")
+    done
+    run_py -c '
+import fnmatch, os, sys, time
+mode, pattern, days = sys.argv[1], sys.argv[2], float(sys.argv[3])
+cutoff = time.time() - days * 86400.0
+count = 0
+total_bytes = 0
+dirs_to_check = []
+stack = list(sys.argv[4:])
+while stack:
+    cur = stack.pop()
+    try:
+        with os.scandir(cur) as it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                        dirs_to_check.append(e.path)
+                    elif e.is_file(follow_symlinks=False) and fnmatch.fnmatch(e.name.lower(), pattern.lower()):
+                        st = e.stat(follow_symlinks=False)
+                        if st.st_mtime < cutoff:
+                            if mode == "prune":
+                                os.unlink(e.path)
+                            count += 1
+                            total_bytes += st.st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+if mode == "prune":
+    for dp in sorted(dirs_to_check, key=len, reverse=True):
+        try:
+            if not os.listdir(dp):
+                os.rmdir(dp)
+        except OSError:
+            pass
+if total_bytes >= 1048576:
+    sz = f"{total_bytes / 1048576:.1f}MB"
+elif total_bytes >= 1024:
+    sz = f"{total_bytes / 1024:.0f}KB"
+else:
+    sz = f"{total_bytes}B"
+print(f"{count} {sz}")
+' "$mode" "$pattern" "$days" "${native_dirs[@]}" 2>/dev/null || echo "0 0B"
+  else
+    local count bytes human
+    count=$({ find "${existing[@]}" -type f -name "$pattern" -mtime +"$days" 2>/dev/null || true; } | wc -l | awk '{print $1}')
+    if [[ "${count:-0}" -gt 0 ]]; then
+      bytes=$({ find "${existing[@]}" -type f -name "$pattern" -mtime +"$days" -exec wc -c {} + 2>/dev/null || true; } | awk '{sum+=$1} END {print sum+0}')
+      if [[ "$mode" == "prune" ]]; then
+        find "${existing[@]}" -type f -name "$pattern" -mtime +"$days" -delete 2>/dev/null || true
+        find "${existing[@]}" -type d -empty -delete 2>/dev/null || true
+      fi
+      human=$(awk -v b="${bytes:-0}" 'BEGIN {if (b>=1048576) printf "%.1fMB", b/1048576; else if (b>=1024) printf "%.0fKB", b/1024; else printf "%dB", b}')
+      echo "${count} ${human}"
+    else
+      echo "0 0B"
+    fi
+  fi
+}
+
 keep_sudo_alive() {
+  [[ $IS_WINDOWS -eq 1 ]] && return 0
   if [[ -z "${SUDO_KEEP_ALIVE_PID:-}" ]]; then
     while true; do
       sudo -n true 2>/dev/null || exit 0
@@ -408,6 +809,18 @@ keep_sudo_alive() {
 run_privileged() {
   local prompt_desc="${1:-system update}"
   shift || true
+
+  if [[ $IS_WINDOWS -eq 1 ]]; then
+    if net session &>/dev/null; then
+      "$@"
+      return $?
+    fi
+    if [[ $NO_SUDO -eq 1 || "${CI:-}" == "true" || "${AIUP_NONINTERACTIVE:-}" == "1" ]]; then
+      return 2
+    fi
+    "$@"
+    return $?
+  fi
 
   if sudo -n true 2>/dev/null; then
     keep_sudo_alive
@@ -440,6 +853,7 @@ run_privileged() {
 
 preauth_sudo_if_safe() {
   # Pre-authenticate at startup ONLY when -S/--sudo is passed and it is safe
+  [[ $IS_WINDOWS -eq 1 ]] && return 0
   [[ $FORCE_PREAUTH -eq 0 ]] && return 0
   [[ $DRY_RUN -eq 1 || $LIST_ONLY -eq 1 || $NO_SUDO -eq 1 ]] && return 0
   [[ "$FILTER_TYPE" == "cli" || "$FILTER_TYPE" == "clean" ]] && return 0
@@ -472,7 +886,9 @@ get_asar_version() {
     echo "unknown"
     return
   fi
-  python3 -c '
+  local native_path
+  native_path="$(to_native_path "$asar_path")"
+  run_py -c '
 import struct, json, sys
 try:
     with open(sys.argv[1], "rb") as f:
@@ -489,87 +905,476 @@ try:
         print(p.get("version", "unknown"))
 except Exception:
     print("unknown")
-' "$asar_path" 2>/dev/null || echo "unknown"
+' "$native_path" 2>/dev/null || echo "unknown"
+}
+
+_APPX_CACHE_LOADED=0
+_APPX_CACHE=""
+
+get_pe_version() {
+  local exe_path="$1"
+  [[ $IS_WINDOWS -eq 1 && -f "$exe_path" ]] || return 1
+  local native_path
+  native_path="$(to_native_path "$exe_path")"
+  powershell.exe -NoProfile -NonInteractive -Command "\$v=(Get-Item -LiteralPath '$native_path').VersionInfo; if(\$v.ProductVersion){\$v.ProductVersion}elseif(\$v.FileVersion){\$v.FileVersion}" < /dev/null 2>/dev/null | strip_cr | awk 'NF{print $1; exit}'
+}
+
+ensure_appx_cache() {
+  [[ $IS_WINDOWS -eq 1 ]] || return 1
+  [[ $_APPX_CACHE_LOADED -eq 1 ]] && return 0
+  _APPX_CACHE_LOADED=1
+  _APPX_CACHE="$(powershell.exe -NoProfile -NonInteractive -Command "Get-AppxPackage | Where-Object { \$_.Name -match 'ChatGPT|Claude|OpenAI\.Codex|Microsoft\.Copilot|Microsoft\.365Copilot|Hermes' } | ForEach-Object { \$_.Name + '|' + \$_.Version }" < /dev/null 2>/dev/null | strip_cr || true)"
+}
+
+get_appx_version() {
+  local substr="$1"
+  [[ $IS_WINDOWS -eq 1 ]] || return 1
+  ensure_appx_cache || return 1
+  printf '%s\n' "$_APPX_CACHE" | awk -F'|' -v pat="$substr" 'index(tolower($1), tolower(pat)) > 0 {print $2; exit}'
+}
+
+# Queries winget for an exact package ID. Prints "installed|available|source" on stdout.
+winget_query_pkg() {
+  local pkg_id="$1"
+  [[ $HAS_WINGET -eq 1 ]] || return 1
+  local raw
+  raw="$(winget.exe list --exact --id "$pkg_id" --accept-source-agreements --disable-interactivity < /dev/null 2>/dev/null | strip_cr || true)"
+  [[ -n "$raw" ]] || return 1
+  run_py -c '
+import re, sys
+raw, pkg_id = sys.argv[1], sys.argv[2]
+lines = []
+for blk in raw.splitlines():
+    part = blk.split("\r")[-1]
+    if part.strip():
+        lines.append(part)
+sep_idx = next((i for i, l in enumerate(lines) if len(l.strip()) >= 10 and set(l.strip()) == {"-"}), -1)
+if sep_idx <= 0:
+    sys.exit(1)
+hdr = lines[sep_idx - 1]
+idx_id = hdr.find("Id")
+idx_ver = hdr.find("Version")
+idx_avail = hdr.find("Available")
+idx_src = hdr.find("Source")
+if idx_id < 0 or idx_ver < 0:
+    sys.exit(1)
+for row in lines[sep_idx + 1:]:
+    m = re.search(re.escape(pkg_id), row, re.I)
+    if m:
+        after_id = row[m.end():].strip()
+        toks = after_id.split()
+        if not toks:
+            continue
+        ver = toks[0]
+        avail = ""
+        src = ""
+        if idx_avail > 0:
+            if len(toks) >= 3:
+                avail, src = toks[1], toks[2]
+            elif len(toks) == 2:
+                # Could be "<ver> <avail>" (no source) or "<ver> <source>" (no avail)
+                if toks[1].lower() in ("winget", "msstore"):
+                    src = toks[1]
+                else:
+                    avail = toks[1]
+        elif len(toks) >= 2:
+            src = toks[1]
+        print(f"{ver}|{avail}|{src}")
+        sys.exit(0)
+sys.exit(1)
+' "$raw" "$pkg_id" 2>/dev/null
+}
+
+get_npm_cache_dir() {
+  local cache_dir=""
+  if command -v npm &>/dev/null; then
+    cache_dir="$(npm config get cache 2>/dev/null | strip_cr || true)"
+    cache_dir="$(to_posix_path "$cache_dir")"
+  fi
+  if [[ -z "$cache_dir" || "$cache_dir" == "undefined" ]]; then
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      cache_dir="${LOCALAPPDATA_DIR}/npm-cache"
+    else
+      cache_dir="${HOME}/.npm"
+    fi
+  fi
+  printf '%s\n' "$cache_dir"
+}
+
+NPM_ROOT_GLOBAL_CACHE=""
+
+init_npm_root_global() {
+  [[ -n "${NPM_ROOT_GLOBAL_CACHE:-}" ]] && return 0
+  local node_root="${HOME}/.local/node/lib/node_modules"
+  if [[ ! -d "$node_root" ]] && command -v npm &>/dev/null; then
+    node_root="$(npm root -g < /dev/null 2>/dev/null | strip_cr || echo '')"
+    node_root="$(to_posix_path "$node_root")"
+  fi
+  NPM_ROOT_GLOBAL_CACHE="$node_root"
 }
 
 get_npm_root_global() {
-  local node_root="${HOME}/.local/node/lib/node_modules"
-  if [[ ! -d "$node_root" ]] && command -v npm &>/dev/null; then
-    node_root="$(npm root -g 2>/dev/null || echo '')"
+  if [[ -n "${NPM_ROOT_GLOBAL_CACHE:-}" ]]; then
+    echo "$NPM_ROOT_GLOBAL_CACHE"
+    return 0
   fi
-  echo "$node_root"
+  init_npm_root_global
+  echo "$NPM_ROOT_GLOBAL_CACHE"
 }
 
 get_npm_pkg_version() {
   local pkg="$1"
   local node_root
   node_root="$(get_npm_root_global)"
-  if [[ -n "$node_root" && -f "${node_root}/${pkg}/package.json" ]] && command -v jq &>/dev/null; then
-    jq -r '.version // "unknown"' "${node_root}/${pkg}/package.json" 2>/dev/null
+  if [[ -n "$node_root" && -f "${node_root}/${pkg}/package.json" ]]; then
+    json_get_file "${node_root}/${pkg}/package.json" ".version" || echo ""
   else
     echo ""
   fi
 }
 
-TRACKED_NPM_PKGS=("command-code" "@qwen-code/qwen-code" "cline")
+get_pip_ai_installed() {
+  # Outputs lines of "<pkg> <version>" for installed tracked AI packages
+  run_py -c '
+import importlib.metadata as m, sys
+for pkg in sys.argv[1:]:
+    try:
+        print(f"{pkg} {m.version(pkg)}")
+    except m.PackageNotFoundError:
+        pass
+' "${TRACKED_PIP_PKGS[@]}" 2>/dev/null | strip_cr
+}
+
+TRACKED_NPM_PKGS=(
+  "command-code"
+  "@qwen-code/qwen-code"
+  "cline"
+  "@google/gemini-cli"
+  "@github/copilot"
+  "@openai/codex"
+  "@anthropic-ai/claude-code"
+  "opencode-ai"
+  "@kilocode/cli"
+  "@mariozechner/pi-coding-agent"
+)
+
+TRACKED_PIP_PKGS=(
+  "graphifyy"
+  "headroom"
+  "honcho-ai"
+  "aider-chat"
+  "open-webui"
+  "llm"
+  "huggingface-hub"
+  "litellm"
+  "browser-use"
+  "mcp"
+  "pydantic-ai"
+  "claude-agent-sdk"
+  "openai-agents"
+  "crewai"
+  "smolagents"
+)
+
+find_first_existing_asar() {
+  local p
+  for p in "$@"; do
+    if [[ -n "$p" && -f "$p" ]]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_first_appimage() {
+  local dir pat f
+  for dir in "$HOME/Applications" "$HOME/.local/bin"; do
+    [[ -d "$dir" ]] || continue
+    for pat in "$@"; do
+      for f in "$dir"/$pat; do
+        if [[ -f "$f" ]]; then
+          printf '%s\n' "$f"
+          return 0
+        fi
+      done
+    done
+  done
+  return 1
+}
+
+get_linux_pkg_version() {
+  local pkg
+  for pkg in "$@"; do
+    if command -v rpm &>/dev/null && rpm -q "$pkg" &>/dev/null; then
+      rpm -q --qf '%{VERSION}\n' "$pkg" 2>/dev/null
+      return 0
+    fi
+    if command -v dpkg-query &>/dev/null && dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+      dpkg-query -W -f='${Version}\n' "$pkg" 2>/dev/null | sed 's/-.*//'
+      return 0
+    fi
+  done
+  return 1
+}
 
 get_version() {
   local tool="$1"
+  local bin_path=""
   case "$tool" in
     agy)
-      command -v agy &>/dev/null && agy --version 2>&1 | head -n 1 | awk '{print $1}' || echo "not installed"
+      bin_path="$(resolve_bin agy 2>/dev/null || true)"
+      [[ -n "$bin_path" ]] && "$bin_path" --version 2>&1 | strip_cr | head -n 1 | awk '{print $1}' || echo "not installed"
       ;;
     claude)
-      command -v claude &>/dev/null && claude --version 2>&1 | head -n 1 | awk '{print $1}' || echo "not installed"
+      bin_path="$(resolve_bin claude 2>/dev/null || true)"
+      [[ -n "$bin_path" ]] && "$bin_path" --version 2>&1 | strip_cr | head -n 1 | awk '{print $1}' || echo "not installed"
       ;;
     codex)
-      command -v codex &>/dev/null && codex --version 2>&1 | head -n 1 | awk '{print $2}' || echo "not installed"
+      bin_path="$(resolve_bin codex 2>/dev/null || true)"
+      [[ -n "$bin_path" ]] && "$bin_path" --version 2>&1 | strip_cr | head -n 1 | awk '{print $2}' || echo "not installed"
       ;;
     hermes)
-      command -v hermes &>/dev/null && (hermes --version 2>&1 | head -n 1 | grep -oE 'v[0-9.]+' || echo "installed") || echo "not installed"
+      bin_path="$(resolve_bin hermes 2>/dev/null || true)"
+      [[ -n "$bin_path" ]] && ("$bin_path" --version 2>&1 | strip_cr | head -n 1 | grep -oE 'v?[0-9]+\.[0-9]+(\.[0-9]+)?' || echo "installed") || echo "not installed"
       ;;
     opencode)
-      command -v opencode &>/dev/null && opencode --version 2>&1 | head -n 1 | awk '{print $2}' || echo "not installed"
+      bin_path="$(resolve_bin opencode 2>/dev/null || true)"
+      [[ -n "$bin_path" ]] && "$bin_path" --version 2>&1 | strip_cr | head -n 1 | awk '{print ($2 != "" ? $2 : $1)}' || echo "not installed"
       ;;
     mimo)
-      command -v mimo &>/dev/null && mimo --version 2>&1 | head -n 1 || echo "not installed"
+      bin_path="$(resolve_bin mimo 2>/dev/null || true)"
+      [[ -n "$bin_path" ]] && "$bin_path" --version 2>&1 | strip_cr | head -n 1 || echo "not installed"
       ;;
     kilo)
-      command -v kilo &>/dev/null && kilo --version 2>&1 | head -n 1 || echo "not installed"
+      bin_path="$(resolve_bin kilo 2>/dev/null || true)"
+      [[ -n "$bin_path" ]] && "$bin_path" --version 2>&1 | strip_cr | head -n 1 || echo "not installed"
       ;;
     goose)
-      command -v goose &>/dev/null && goose --version 2>&1 | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "not installed"
+      bin_path="$(resolve_bin goose 2>/dev/null || true)"
+      [[ -n "$bin_path" ]] && "$bin_path" --version 2>&1 | strip_cr | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "not installed"
+      ;;
+    ollama)
+      bin_path="$(resolve_bin ollama 2>/dev/null || true)"
+      if [[ -n "$bin_path" ]]; then
+        "$bin_path" --version 2>&1 | strip_cr | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || echo "installed"
+      else
+        echo "not installed"
+      fi
+      ;;
+    lms)
+      bin_path="$(resolve_bin lms 2>/dev/null || true)"
+      if [[ -n "$bin_path" ]]; then
+        "$bin_path" --version 2>&1 | strip_cr | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || echo "installed"
+      elif [[ $IS_WINDOWS -eq 1 && -f "${LOCALAPPDATA_DIR}/Programs/LM Studio/LM Studio.exe" ]]; then
+        get_pe_version "${LOCALAPPDATA_DIR}/Programs/LM Studio/LM Studio.exe" || echo "installed"
+      else
+        echo "not installed"
+      fi
       ;;
     chatgpt)
-      if command -v rpm &>/dev/null && rpm -q chatgpt &>/dev/null; then
-        rpm -q --qf '%{VERSION}\n' chatgpt 2>/dev/null
+      if [[ $IS_LINUX -eq 1 ]]; then
+        get_linux_pkg_version chatgpt && return 0
+        if command -v flatpak &>/dev/null && flatpak info com.openai.ChatGPT &>/dev/null; then
+          flatpak info com.openai.ChatGPT 2>/dev/null | awk -F: '/Version:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}'
+          return 0
+        fi
+        echo "not installed"
       elif [[ $IS_MACOS -eq 1 && -d "/Applications/ChatGPT.app" ]]; then
         defaults read /Applications/ChatGPT.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo "installed"
+      elif [[ $IS_WINDOWS -eq 1 ]]; then
+        local appx_v
+        appx_v="$(get_appx_version 'OpenAI.ChatGPT' || true)"
+        if [[ -n "$appx_v" ]]; then
+          echo "$appx_v"
+        elif [[ -f "${LOCALAPPDATA_DIR}/Programs/ChatGPT/ChatGPT.exe" ]]; then
+          get_pe_version "${LOCALAPPDATA_DIR}/Programs/ChatGPT/ChatGPT.exe" || echo "installed"
+        else
+          echo "not installed"
+        fi
       else
         echo "not installed"
       fi
       ;;
     opencode-desktop)
-      if command -v rpm &>/dev/null && rpm -q opencode &>/dev/null; then
-        rpm -q --qf '%{VERSION}\n' opencode 2>/dev/null
-      elif [[ -d "/opt/OpenCode" ]]; then
-        echo "unmanaged"
+      if [[ $IS_LINUX -eq 1 ]]; then
+        get_linux_pkg_version opencode opencode-desktop && return 0
+        local appimg
+        appimg="$(find_first_appimage 'OpenCode*.AppImage' 'opencode*.AppImage' 2>/dev/null || true)"
+        if [[ -n "$appimg" ]]; then
+          printf '%s\n' "$appimg" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "AppImage"
+        elif [[ -d "/opt/OpenCode" ]]; then
+          echo "unmanaged"
+        else
+          echo "not installed"
+        fi
+      elif [[ $IS_WINDOWS -eq 1 ]]; then
+        local asar_p
+        asar_p="$(find_first_existing_asar "${LOCALAPPDATA_DIR}/Programs/OpenCode/resources/app.asar" "${PROGRAMFILES_DIR}/OpenCode/resources/app.asar" 2>/dev/null || true)"
+        if [[ -n "$asar_p" ]]; then
+          get_asar_version "$asar_p"
+        elif [[ -f "${LOCALAPPDATA_DIR}/Programs/OpenCode/OpenCode.exe" ]]; then
+          get_pe_version "${LOCALAPPDATA_DIR}/Programs/OpenCode/OpenCode.exe" || echo "installed"
+        else
+          echo "not installed"
+        fi
+      elif [[ $IS_MACOS -eq 1 && -d "/Applications/OpenCode.app" ]]; then
+        defaults read /Applications/OpenCode.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo "installed"
       else
         echo "not installed"
       fi
       ;;
     aionui)
-      [[ -f "$HOME/.local/opt/AionUi/resources/app.asar" ]] && get_asar_version "$HOME/.local/opt/AionUi/resources/app.asar" || echo "not installed"
+      if [[ $IS_WINDOWS -eq 1 ]]; then
+        local asar_p
+        asar_p="$(find_first_existing_asar "${LOCALAPPDATA_DIR}/Programs/AionUi/resources/app.asar" "${PROGRAMFILES_DIR}/AionUi/resources/app.asar" 2>/dev/null || true)"
+        [[ -n "$asar_p" ]] && get_asar_version "$asar_p" || echo "not installed"
+      elif [[ $IS_MACOS -eq 1 && -f "/Applications/AionUi.app/Contents/Resources/app.asar" ]]; then
+        get_asar_version "/Applications/AionUi.app/Contents/Resources/app.asar"
+      else
+        local asar_p
+        asar_p="$(find_first_existing_asar "$HOME/.local/opt/AionUi/resources/app.asar" "/opt/AionUi/resources/app.asar" 2>/dev/null || true)"
+        if [[ -n "$asar_p" ]]; then
+          get_asar_version "$asar_p"
+        elif [[ $IS_LINUX -eq 1 ]] && get_linux_pkg_version aionui AionUi 2>/dev/null; then
+          return 0
+        else
+          echo "not installed"
+        fi
+      fi
       ;;
     antigravity-desktop)
-      [[ -f "$HOME/.local/share/antigravity/resources/app.asar" ]] && get_asar_version "$HOME/.local/share/antigravity/resources/app.asar" || echo "not installed"
+      if [[ $IS_WINDOWS -eq 1 ]]; then
+        local asar_p
+        asar_p="$(find_first_existing_asar "${LOCALAPPDATA_DIR}/Programs/Antigravity/resources/app.asar" "${LOCALAPPDATA_DIR}/antigravity/resources/app.asar" "${PROGRAMFILES_DIR}/Antigravity/resources/app.asar" 2>/dev/null || true)"
+        [[ -n "$asar_p" ]] && get_asar_version "$asar_p" || echo "not installed"
+      elif [[ $IS_MACOS -eq 1 && -f "/Applications/Antigravity.app/Contents/Resources/app.asar" ]]; then
+        get_asar_version "/Applications/Antigravity.app/Contents/Resources/app.asar"
+      else
+        local asar_p
+        asar_p="$(find_first_existing_asar "$HOME/.local/share/antigravity/resources/app.asar" "/usr/share/antigravity/resources/app.asar" "/opt/Antigravity/resources/app.asar" 2>/dev/null || true)"
+        if [[ -n "$asar_p" ]]; then
+          get_asar_version "$asar_p"
+        elif [[ $IS_LINUX -eq 1 ]] && get_linux_pkg_version antigravity 2>/dev/null; then
+          return 0
+        else
+          echo "not installed"
+        fi
+      fi
+      ;;
+    zcode)
+      if [[ $IS_WINDOWS -eq 1 ]]; then
+        local asar_p
+        asar_p="$(find_first_existing_asar "${PROGRAMFILES_DIR}/ZCode/resources/app.asar" "${LOCALAPPDATA_DIR}/Programs/ZCode/resources/app.asar" 2>/dev/null || true)"
+        if [[ -n "$asar_p" ]]; then
+          get_asar_version "$asar_p"
+        elif [[ -f "${PROGRAMFILES_DIR}/ZCode/ZCode.exe" ]]; then
+          get_pe_version "${PROGRAMFILES_DIR}/ZCode/ZCode.exe" || echo "installed"
+        else
+          echo "not installed"
+        fi
+      elif [[ $IS_MACOS -eq 1 && -f "/Applications/ZCode.app/Contents/Resources/app.asar" ]]; then
+        get_asar_version "/Applications/ZCode.app/Contents/Resources/app.asar"
+      else
+        local asar_p
+        asar_p="$(find_first_existing_asar "$HOME/.local/opt/ZCode/resources/app.asar" "/opt/ZCode/resources/app.asar" 2>/dev/null || true)"
+        if [[ -n "$asar_p" ]]; then
+          get_asar_version "$asar_p"
+        elif [[ $IS_LINUX -eq 1 ]] && get_linux_pkg_version zcode ZCode 2>/dev/null; then
+          return 0
+        else
+          local appimg
+          appimg="$(find_first_appimage 'ZCode*.AppImage' 'zcode*.AppImage' 2>/dev/null || true)"
+          if [[ -n "$appimg" ]]; then
+            printf '%s\n' "$appimg" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "AppImage"
+          else
+            echo "not installed"
+          fi
+        fi
+      fi
+      ;;
+    copilot)
+      if [[ $IS_WINDOWS -eq 1 ]]; then
+        local exe_p="${PROGRAMFILES_X86_DIR}/Microsoft/Copilot/Application/copilotapp.exe"
+        if [[ -f "$exe_p" ]]; then
+          get_pe_version "$exe_p" || echo "installed"
+        else
+          local appx_v
+          appx_v="$(get_appx_version 'Microsoft.Copilot' || get_appx_version 'Microsoft.365Copilot' || true)"
+          [[ -n "$appx_v" ]] && echo "$appx_v" || echo "not installed"
+        fi
+      else
+        local gh_c=""
+        if command -v gh &>/dev/null; then
+          gh_c="$(gh extension list 2>/dev/null | awk '/copilot/ {print $NF; exit}' || true)"
+        fi
+        if [[ -n "$gh_c" ]]; then
+          echo "$gh_c"
+        elif bin_path="$(resolve_bin copilot 2>/dev/null || true)" && [[ -n "$bin_path" ]]; then
+          "$bin_path" --version 2>&1 | head -n 1 | awk '{print $NF}'
+        else
+          echo "not installed"
+        fi
+      fi
+      ;;
+    claude-desktop)
+      if [[ $IS_WINDOWS -eq 1 ]]; then
+        local appx_v
+        appx_v="$(get_appx_version 'Claude' || true)"
+        if [[ -n "$appx_v" ]]; then
+          echo "$appx_v"
+        elif [[ -f "${LOCALAPPDATA_DIR}/AnthropicClaude/claude.exe" ]]; then
+          get_pe_version "${LOCALAPPDATA_DIR}/AnthropicClaude/claude.exe" || echo "installed"
+        else
+          echo "not installed"
+        fi
+      elif [[ $IS_MACOS -eq 1 && -d "/Applications/Claude.app" ]]; then
+        defaults read /Applications/Claude.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo "installed"
+      else
+        local asar_p
+        asar_p="$(find_first_existing_asar "/opt/Claude/resources/app.asar" "/usr/lib/claude-desktop/resources/app.asar" "$HOME/.local/opt/Claude/resources/app.asar" 2>/dev/null || true)"
+        if [[ -n "$asar_p" ]]; then
+          get_asar_version "$asar_p"
+        elif [[ $IS_LINUX -eq 1 ]] && get_linux_pkg_version claude-desktop 2>/dev/null; then
+          return 0
+        else
+          echo "not installed"
+        fi
+      fi
+      ;;
+    codex-desktop)
+      if [[ $IS_WINDOWS -eq 1 ]]; then
+        local appx_v
+        appx_v="$(get_appx_version 'OpenAI.Codex' || true)"
+        if [[ -n "$appx_v" ]]; then
+          echo "$appx_v"
+        elif [[ -f "${LOCALAPPDATA_DIR}/Programs/Codex/Codex.exe" ]]; then
+          get_pe_version "${LOCALAPPDATA_DIR}/Programs/Codex/Codex.exe" || echo "installed"
+        elif [[ -f "${PROGRAMFILES_DIR}/OpenAI/Codex/Codex.exe" ]]; then
+          get_pe_version "${PROGRAMFILES_DIR}/OpenAI/Codex/Codex.exe" || echo "installed"
+        else
+          echo "not installed"
+        fi
+      elif [[ $IS_MACOS -eq 1 && -d "/Applications/Codex.app" ]]; then
+        defaults read /Applications/Codex.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo "installed"
+      else
+        local asar_p
+        asar_p="$(find_first_existing_asar "/opt/Codex/resources/app.asar" "$HOME/.local/opt/Codex/resources/app.asar" 2>/dev/null || true)"
+        if [[ -n "$asar_p" ]]; then
+          get_asar_version "$asar_p"
+        elif [[ $IS_LINUX -eq 1 ]] && get_linux_pkg_version codex-desktop 2>/dev/null; then
+          return 0
+        else
+          echo "not installed"
+        fi
+      fi
       ;;
     cowork-os)
       if [[ -d "$HOME/CoWork-OS/.git" ]]; then
         local hash pkg_ver
         hash=$(git -C "$HOME/CoWork-OS" rev-parse --short HEAD 2>/dev/null || echo "git")
-        pkg_ver=$(jq -r '.version // "unknown"' "$HOME/CoWork-OS/package.json" 2>/dev/null || echo "dev")
-        echo "v${pkg_ver} (${hash})"
+        pkg_ver=$(json_get_file "$HOME/CoWork-OS/package.json" ".version" || echo "dev")
+        echo "v${pkg_ver:-unknown} (${hash})"
       else
         echo "not found"
       fi
@@ -578,20 +1383,39 @@ get_version() {
       if [[ -d "$HOME/Orkas/.git" ]]; then
         local hash pkg_ver
         hash=$(git -C "$HOME/Orkas" rev-parse --short HEAD 2>/dev/null || echo "git")
-        pkg_ver=$(jq -r '.version // "unknown"' "$HOME/Orkas/package.json" 2>/dev/null || echo "dev")
-        echo "v${pkg_ver} (${hash})"
+        pkg_ver=$(json_get_file "$HOME/Orkas/package.json" ".version" || echo "dev")
+        echo "v${pkg_ver:-unknown} (${hash})"
       else
         echo "not found"
       fi
       ;;
     hermes-desktop)
-      command -v hermes &>/dev/null && echo "Available" || echo "not installed"
+      if [[ $IS_WINDOWS -eq 1 ]]; then
+        local appx_v
+        appx_v="$(get_appx_version 'NousResearch.Hermes' || true)"
+        if [[ -n "$appx_v" ]]; then
+          echo "$appx_v"
+          return 0
+        fi
+      fi
+      bin_path="$(resolve_bin hermes 2>/dev/null || true)"
+      [[ -n "$bin_path" ]] && echo "Available" || echo "not installed"
       ;;
     uv-tools)
-      if command -v uv &>/dev/null; then
+      bin_path="$(resolve_bin uv 2>/dev/null || true)"
+      if [[ -n "$bin_path" ]]; then
         local uv_pkgs
-        uv_pkgs=$(uv tool list 2>/dev/null | grep -E '^[a-zA-Z0-9._-]+\s+v?[0-9]' | awk '{printf "%s@%s ", $1, $2}' | sed 's/ $//')
+        uv_pkgs=$("$bin_path" tool list 2>/dev/null | strip_cr | grep -E '^[a-zA-Z0-9._-]+\s+v?[0-9]' | awk '{printf "%s@%s ", $1, $2}' | sed 's/ $//')
         echo "${uv_pkgs:-none}"
+      else
+        echo "not installed"
+      fi
+      ;;
+    pip-ai)
+      if [[ ${#PYTHON_CMD[@]} -gt 0 ]] || detect_python; then
+        local pip_pkgs
+        pip_pkgs=$(get_pip_ai_installed | awk '{printf "%s@%s ", $1, $2}' | sed 's/ $//')
+        echo "${pip_pkgs:-none}"
       else
         echo "not installed"
       fi
@@ -605,7 +1429,6 @@ get_version() {
           [[ -n "$v" ]] && items+="${p##*/}@${v} "
         done
         echo "${items% }"
-        [[ -z "$items" ]] && true
       else
         echo "not installed"
       fi
@@ -616,9 +1439,25 @@ get_version() {
   esac
 }
 
+summarize_list_items() {
+  local raw="$1"
+  local noun="$2"
+  if [[ "$raw" == "none" || "$raw" == "not installed" || -z "$raw" ]]; then
+    echo "${raw:-none}"
+    return
+  fi
+  local -a arr
+  read -ra arr <<< "$raw"
+  if [[ ${#arr[@]} -eq 1 && "$noun" == "tool" ]]; then
+    echo "${arr[0]%%@*}"
+  else
+    echo "${#arr[@]} ${noun}(s)"
+  fi
+}
+
 list_harnesses() {
-  local v_agy v_claude v_codex v_hermes v_opencode v_mimo v_kilo v_goose v_uv v_npm
-  local v_chatgpt v_opencode_desk v_aionui v_ag_desk v_cowork v_orkas v_hermes_desk
+  local v_agy v_claude v_codex v_hermes v_opencode v_mimo v_kilo v_goose v_uv v_pip v_npm v_ollama v_lms
+  local v_chatgpt v_opencode_desk v_aionui v_ag_desk v_zcode v_copilot v_claude_desk v_codex_desk v_cowork v_orkas v_hermes_desk
   v_agy="$(get_version agy)"
   v_claude="$(get_version claude)"
   v_codex="$(get_version codex)"
@@ -628,55 +1467,51 @@ list_harnesses() {
   v_kilo="$(get_version kilo)"
   v_goose="$(get_version goose)"
   v_uv="$(get_version uv-tools)"
+  v_pip="$(get_version pip-ai)"
+  init_npm_root_global
+  [[ $IS_WINDOWS -eq 1 ]] && ensure_appx_cache || true
   v_npm="$(get_version npm-globals)"
   [[ -z "$v_npm" ]] && v_npm="none"
+  v_ollama="$(get_version ollama)"
+  v_lms="$(get_version lms)"
 
   v_chatgpt="$(get_version chatgpt)"
   v_opencode_desk="$(get_version opencode-desktop)"
   v_aionui="$(get_version aionui)"
   v_ag_desk="$(get_version antigravity-desktop)"
+  v_zcode="$(get_version zcode)"
+  v_copilot="$(get_version copilot)"
+  v_claude_desk="$(get_version claude-desktop)"
+  v_codex_desk="$(get_version codex-desktop)"
   v_cowork="$(get_version cowork-os)"
   v_orkas="$(get_version orkas)"
   v_hermes_desk="$(get_version hermes-desktop)"
 
   if [[ "$OUTPUT_FORMAT" == "json" ]]; then
-    python3 -c '
+    run_py -c '
 import json, sys
-keys_cli = ["agy", "claude", "codex", "hermes", "opencode", "mimo", "kilo", "goose", "uv_tools", "npm_globals"]
-keys_desk = ["chatgpt", "opencode_desktop", "aionui", "antigravity_desktop", "cowork_os", "orkas", "hermes_desktop"]
+keys_cli = ["agy", "claude", "codex", "hermes", "opencode", "mimo", "kilo", "goose", "uv_tools", "pip_ai", "npm_globals", "ollama", "lms"]
+keys_desk = ["chatgpt", "opencode_desktop", "aionui", "antigravity_desktop", "zcode", "copilot", "claude_desktop", "codex_desktop", "cowork_os", "orkas", "hermes_desktop"]
 data = {
     "version": sys.argv[1],
     "os": sys.argv[2],
     "arch": sys.argv[3],
     "pkg_manager": sys.argv[4],
-    "cli_harnesses": dict(zip(keys_cli, sys.argv[5:15])),
-    "desktop_apps": dict(zip(keys_desk, sys.argv[15:22])),
+    "cli_harnesses": dict(zip(keys_cli, sys.argv[5:18])),
+    "desktop_apps": dict(zip(keys_desk, sys.argv[18:29])),
 }
 print(json.dumps(data, indent=2))
 ' \
-      "$VERSION" "$OS" "$ARCH" "$PKG_MGR" \
-      "$v_agy" "$v_claude" "$v_codex" "$v_hermes" "$v_opencode" "$v_mimo" "$v_kilo" "$v_goose" "$v_uv" "$v_npm" \
-      "$v_chatgpt" "$v_opencode_desk" "$v_aionui" "$v_ag_desk" "$v_cowork" "$v_orkas" "$v_hermes_desk"
+      "$VERSION" "$HOST_OS" "$ARCH" "$PKG_MGR" \
+      "$v_agy" "$v_claude" "$v_codex" "$v_hermes" "$v_opencode" "$v_mimo" "$v_kilo" "$v_goose" "$v_uv" "$v_pip" "$v_npm" "$v_ollama" "$v_lms" \
+      "$v_chatgpt" "$v_opencode_desk" "$v_aionui" "$v_ag_desk" "$v_zcode" "$v_copilot" "$v_claude_desk" "$v_codex_desk" "$v_cowork" "$v_orkas" "$v_hermes_desk"
     exit 0
   fi
 
-  local uv_summary="$v_uv"
-  if [[ "$v_uv" != "none" && "$v_uv" != "not installed" ]]; then
-    local -a _uv_arr
-    read -ra _uv_arr <<< "$v_uv"
-    if [[ ${#_uv_arr[@]} -eq 1 ]]; then
-      uv_summary="${_uv_arr[0]%%@*}"
-    else
-      uv_summary="${#_uv_arr[@]} tool(s)"
-    fi
-  fi
-
-  local npm_summary="$v_npm"
-  if [[ "$v_npm" != "none" && "$v_npm" != "not installed" ]]; then
-    local -a _npm_arr
-    read -ra _npm_arr <<< "$v_npm"
-    npm_summary="${#_npm_arr[@]} package(s)"
-  fi
+  local uv_summary pip_summary npm_summary
+  uv_summary="$(summarize_list_items "$v_uv" "tool")"
+  pip_summary="$(summarize_list_items "$v_pip" "package")"
+  npm_summary="$(summarize_list_items "$v_npm" "package")"
 
   echo -e "${BOLD}${CYAN}╭────────────────────────────────────────────────────────────────────╮${RESET}"
   echo -e "${BOLD}${CYAN}│${RESET}  ${BOLD}⚡ AIUP Installed Inventory${RESET}                                       ${BOLD}${CYAN}│${RESET}"
@@ -695,20 +1530,31 @@ print(json.dumps(data, indent=2))
   printf "  │ %-24s │ %-26s │ %-14s │\n" "Kilo Agent" "kilo" "${v_kilo:0:14}"
   printf "  │ %-24s │ %-26s │ %-14s │\n" "Goose CLI" "goose" "${v_goose:0:14}"
   printf "  │ %-24s │ %-26s │ %-14s │\n" "Python uv Tools" "uv tool" "${uv_summary:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Python pip AI Tools" "pip (AI packages)" "${pip_summary:0:14}"
   printf "  │ %-24s │ %-26s │ %-14s │\n" "NPM AI Globals" "npm (global)" "${npm_summary:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Ollama Runtime" "ollama" "${v_ollama:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "LM Studio CLI" "lms" "${v_lms:0:14}"
   echo -e "  ╰──────────────────────────┴────────────────────────────┴────────────────╯"
   echo ""
   echo -e "  ${BOLD}${MAGENTA}❖ DESKTOP AI APPS & WORKSPACES${RESET}"
   echo -e "  ╭──────────────────────────┬────────────────────────────┬────────────────╮"
   echo -e "  │ Application              │ Binary / Environment       │ Version        │"
   echo -e "  ├──────────────────────────┼────────────────────────────┼────────────────┤"
-  printf "  │ %-24s │ %-26s │ %-14s │\n" "ChatGPT Desktop" "RPM (/usr/bin/chatgpt)" "${v_chatgpt:0:14}"
-  printf "  │ %-24s │ %-26s │ %-14s │\n" "OpenCode Desktop" "RPM (/opt/OpenCode)" "${v_opencode_desk:0:14}"
-  printf "  │ %-24s │ %-26s │ %-14s │\n" "AionUi Workspace" "Electron (~/.local/opt)" "${v_aionui:0:14}"
-  printf "  │ %-24s │ %-26s │ %-14s │\n" "Antigravity IDE" "IDE (~/.local/share)" "${v_ag_desk:0:14}"
-  printf "  │ %-24s │ %-26s │ %-14s │\n" "CoWork-OS Desktop" "Electron (~/CoWork-OS)" "${v_cowork%% *}"
-  printf "  │ %-24s │ %-26s │ %-14s │\n" "Orkas Desktop Client" "Electron (~/Orkas)" "${v_orkas%% *}"
-  printf "  │ %-24s │ %-26s │ %-14s │\n" "Hermes Desktop UI" "UI (hermes desktop)" "${v_hermes_desk:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "ChatGPT Desktop" "App (RPM/DEB/MSIX/macOS)" "${v_chatgpt:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "OpenCode Desktop" "App (RPM/DEB/AppImage/Win)" "${v_opencode_desk:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "AionUi Workspace" "Electron (app.asar/winget)" "${v_aionui:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Antigravity IDE" "IDE (app.asar/pkg)" "${v_ag_desk:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "ZCode Desktop" "Electron (ZCode/winget)" "${v_zcode:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Microsoft Copilot" "App / gh-copilot CLI" "${v_copilot:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Claude Desktop" "App (Anthropic.Claude)" "${v_claude_desk:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Codex Desktop" "App (OpenAI.Codex)" "${v_codex_desk:0:14}"
+  local cowork_disp="$v_cowork"
+  [[ "$cowork_disp" != "not found" ]] && cowork_disp="${v_cowork%% *}"
+  local orkas_disp="$v_orkas"
+  [[ "$orkas_disp" != "not found" ]] && orkas_disp="${v_orkas%% *}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "CoWork-OS Desktop" "Electron (~/CoWork-OS)" "${cowork_disp:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Orkas Desktop Client" "Electron (~/Orkas)" "${orkas_disp:0:14}"
+  printf "  │ %-24s │ %-26s │ %-14s │\n" "Hermes Desktop UI" "UI (hermes/MSIX)" "${v_hermes_desk:0:14}"
   echo -e "  ╰──────────────────────────┴────────────────────────────┴────────────────╯"
   echo ""
   exit 0
@@ -718,23 +1564,25 @@ print(json.dumps(data, indent=2))
 run_self_updater_cli() {
   local id="$1"
   local title="$2"
-  local bin="$3"
+  local bin_name="$3"
   local subcmd="$4"
   local step_msg="$5"
   local uptodate_re="$6"
   local updated_re="$7"
 
-  command -v "$bin" &>/dev/null || return 0
+  local bin
+  bin="$(resolve_bin "$bin_name" 2>/dev/null || true)"
+  [[ -n "$bin" ]] || return 0
   should_run "$id" "cli" || return 0
 
   log_card_start "$title" "cli"
   local t_start curr_v dur output rc=0 post_v
-  t_start=$(date +%s%N)
+  t_start="$(now_ns)"
   curr_v="$(get_version "$id")"
 
   if [[ $DRY_RUN -eq 1 ]]; then
     log_step "Installed version: ${curr_v}"
-    log_step "Skipping update execution (${bin} has no non-mutating --check mode)"
+    log_step "Skipping update execution (${bin_name} has no non-mutating --check mode)"
     dur="$(elapsed_since "$t_start")"
     log_card_end "SKIPPED" "v${curr_v#v} (no CLI --check)" "$dur"
     record_result "$id" "CLI" "SKIPPED" "No CLI --check" "$dur"
@@ -742,26 +1590,186 @@ run_self_updater_cli() {
   fi
 
   log_step "$step_msg"
-  output="$("$bin" "$subcmd" 2>&1)" || rc=$?
+  output="$("$bin" "$subcmd" 2>&1 | strip_cr)" || rc=$?
   printf '%s\n' "$output" | stream_progress 4
   post_v="$(get_version "$id")"
   dur="$(elapsed_since "$t_start")"
 
-  if [[ -n "$updated_re" ]] && printf '%s\n' "$output" | grep -qiE "$updated_re"; then
-    log_card_end "UPDATED" "Upgraded to ${post_v}" "$dur"
-    record_result "$id" "CLI" "UPDATED" "${post_v}" "$dur"
+  if [[ $rc -ne 0 ]]; then
+    log_card_end "FAILED" "${bin_name} ${subcmd} exited ${rc}" "$dur"
+    record_result "$id" "CLI" "FAILED" "Exit ${rc}" "$dur"
   elif [[ "$post_v" != "$curr_v" && -n "$post_v" && "$post_v" != "not installed" ]]; then
     log_card_end "UPDATED" "${curr_v} → ${post_v}" "$dur"
     record_result "$id" "CLI" "UPDATED" "${post_v}" "$dur"
-  elif [[ $rc -ne 0 ]]; then
-    log_card_end "FAILED" "${bin} ${subcmd} exited ${rc}" "$dur"
-    record_result "$id" "CLI" "FAILED" "Exit ${rc}" "$dur"
   elif [[ -n "$uptodate_re" ]] && printf '%s\n' "$output" | grep -qiE "$uptodate_re"; then
     log_card_end "UP TO DATE" "Current (${post_v})" "$dur"
     record_result "$id" "CLI" "UP TO DATE" "${post_v}" "$dur"
+  elif [[ -n "$updated_re" ]] && printf '%s\n' "$output" | grep -qiE "$updated_re"; then
+    log_card_end "UPDATED" "Upgraded to ${post_v}" "$dur"
+    record_result "$id" "CLI" "UPDATED" "${post_v}" "$dur"
   else
     log_card_end "UP TO DATE" "Verified (${post_v})" "$dur"
     record_result "$id" "CLI" "UP TO DATE" "${post_v}" "$dur"
+  fi
+}
+
+# Shared helper for Windows winget-managed apps (with optional fallback check function)
+run_winget_app() {
+  local id="$1"
+  local title="$2"
+  local scope="$3"       # "CLI" or "DESKTOP"
+  local pkg_id="$4"
+  local local_ver="$5"
+  local card_type
+  card_type="$(printf '%s' "$scope" | tr '[:upper:]' '[:lower:]')"
+
+  local t_start dur wg_info inst_v avail_v curr_v upg_rc=0 post_v
+  t_start="$(now_ns)"
+
+  if [[ $HAS_WINGET -eq 0 ]]; then
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "SKIPPED" "v${local_ver#v} (winget unavailable)" "$dur"
+    record_result "$id" "$scope" "SKIPPED" "No winget" "$dur"
+    return 0
+  fi
+
+  log_step "Querying winget manifest (${pkg_id})..."
+  wg_info="$(winget_query_pkg "$pkg_id" || true)"
+  if [[ -z "$wg_info" ]]; then
+    return 2
+  fi
+
+  IFS='|' read -r inst_v avail_v _ <<< "$wg_info"
+  curr_v="${inst_v:-$local_ver}"
+
+  if [[ -n "$avail_v" ]] && { [[ "$avail_v" != "$curr_v" ]] || is_version_gt "$avail_v" "$curr_v"; }; then
+    log_step "Found newer version: ${avail_v} (installed: ${curr_v})"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "UPDATE AVAIL" "${curr_v} → ${avail_v}" "$dur"
+      record_result "$id" "$scope" "UPDATE AVAIL" "${avail_v}" "$dur"
+      return 0
+    fi
+    log_step "Upgrading ${pkg_id} via winget..."
+    winget.exe upgrade --exact --id "$pkg_id" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity < /dev/null 2>&1 | strip_cr | stream_progress 5 || upg_rc=$?
+    post_v="$(get_version "$id")"
+    [[ "$post_v" == "not installed" || -z "$post_v" ]] && post_v="$avail_v"
+    dur="$(elapsed_since "$t_start")"
+    if [[ $upg_rc -eq 0 ]]; then
+      log_card_end "UPDATED" "Upgraded to ${post_v}" "$dur"
+      record_result "$id" "$scope" "UPDATED" "${post_v}" "$dur"
+    else
+      log_card_end "FAILED" "winget upgrade exited ${upg_rc}" "$dur"
+      record_result "$id" "$scope" "FAILED" "winget (${upg_rc})" "$dur"
+    fi
+  else
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "UP TO DATE" "Version ${curr_v} is current" "$dur"
+    record_result "$id" "$scope" "UP TO DATE" "v${curr_v#v}" "$dur"
+  fi
+  return 0
+}
+
+# Shared helper for GitHub latest release check (read-only alert or optional verification)
+check_github_release_status() {
+  local id="$1"
+  local scope="$2"
+  local repo="$3"
+  local curr_v="$4"
+  local t_start="$5"
+  local latest_tag dur
+
+  log_step "Checking GitHub releases for ${repo}..."
+  latest_tag=$(curl -s --connect-timeout 4 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | json_get_stdin "tag_name" | sed 's/^v//')
+  dur="$(elapsed_since "$t_start")"
+
+  if [[ -z "$latest_tag" ]]; then
+    log_card_end "SKIPPED" "GitHub check unavailable (local v${curr_v#v})" "$dur"
+    record_result "$id" "$scope" "SKIPPED" "Check failed" "$dur"
+  elif is_version_gt "$latest_tag" "$curr_v"; then
+    log_step "New release available: v${latest_tag} (manual download)"
+    log_card_end "UPDATE AVAIL" "v${curr_v#v} → v${latest_tag} (manual)" "$dur"
+    record_result "$id" "$scope" "UPDATE AVAIL" "v${latest_tag} (manual)" "$dur"
+  else
+    log_card_end "UP TO DATE" "Version v${curr_v#v} is current" "$dur"
+    record_result "$id" "$scope" "UP TO DATE" "v${curr_v#v}" "$dur"
+  fi
+}
+
+# Shared helper for Linux DNF/APT package upgrade
+run_linux_pkg_upgrade() {
+  local id="$1"
+  local pkg_name="$2"
+  local curr_v="$3"
+  local t_start="$4"
+  local dur avail_v="" upg_rc=0
+
+  if [[ "$PKG_MGR" == "dnf" ]]; then
+    log_step "Checking DNF repository for ${pkg_name}..."
+    local dnf_rc=0 dnf_out
+    dnf_out=$(dnf check-update "$pkg_name" 2>&1) || dnf_rc=$?
+    if [[ $dnf_rc -eq 100 ]]; then
+      avail_v=$(printf '%s\n' "$dnf_out" | awk -v p="$pkg_name" '$1 ~ p {print $2; exit}')
+      log_step "Found newer version: ${avail_v:-latest} (current: ${curr_v})"
+      if [[ $DRY_RUN -eq 1 ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "UPDATE AVAIL" "${curr_v} → ${avail_v:-latest}" "$dur"
+        record_result "$id" "DESKTOP" "UPDATE AVAIL" "${avail_v:-latest}" "$dur"
+      else
+        run_privileged "${pkg_name} DNF upgrade" dnf upgrade -y "$pkg_name" 2>&1 | stream_progress 4 || upg_rc=$?
+        dur="$(elapsed_since "$t_start")"
+        if [[ $upg_rc -eq 0 ]]; then
+          log_card_end "UPDATED" "Upgraded via DNF (${avail_v:-latest})" "$dur"
+          record_result "$id" "DESKTOP" "UPDATED" "${avail_v:-Upgraded}" "$dur"
+        elif [[ $upg_rc -eq 1 || $upg_rc -eq 2 ]]; then
+          log_card_end "UPDATE AVAIL" "Auth skipped; run: sudo dnf upgrade -y ${pkg_name}" "$dur"
+          record_result "$id" "DESKTOP" "UPDATE AVAIL" "sudo dnf upgrade" "$dur"
+        else
+          log_card_end "FAILED" "DNF upgrade exited ${upg_rc}" "$dur"
+          record_result "$id" "DESKTOP" "FAILED" "DNF error (${upg_rc})" "$dur"
+        fi
+      fi
+    elif [[ $dnf_rc -ne 0 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "FAILED" "DNF check-update exited ${dnf_rc}" "$dur"
+      record_result "$id" "DESKTOP" "FAILED" "DNF check error" "$dur"
+    else
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "UP TO DATE" "Version ${curr_v} is current" "$dur"
+      record_result "$id" "DESKTOP" "UP TO DATE" "v${curr_v#v}" "$dur"
+    fi
+  elif [[ "$PKG_MGR" == "apt" ]]; then
+    log_step "Checking APT policy for ${pkg_name}..."
+    local apt_cand
+    apt_cand=$(apt-cache policy "$pkg_name" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
+    if [[ -n "$apt_cand" && "$apt_cand" != "(none)" ]] && is_version_gt "${apt_cand%%-*}" "$curr_v"; then
+      if [[ $DRY_RUN -eq 1 ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "UPDATE AVAIL" "${curr_v} → ${apt_cand}" "$dur"
+        record_result "$id" "DESKTOP" "UPDATE AVAIL" "${apt_cand}" "$dur"
+      else
+        run_privileged "${pkg_name} APT upgrade" apt-get install -y --only-upgrade "$pkg_name" 2>&1 | stream_progress 4 || upg_rc=$?
+        dur="$(elapsed_since "$t_start")"
+        if [[ $upg_rc -eq 0 ]]; then
+          log_card_end "UPDATED" "Upgraded via APT (${apt_cand})" "$dur"
+          record_result "$id" "DESKTOP" "UPDATED" "${apt_cand}" "$dur"
+        elif [[ $upg_rc -eq 1 || $upg_rc -eq 2 ]]; then
+          log_card_end "UPDATE AVAIL" "Auth skipped; run: sudo apt-get install --only-upgrade ${pkg_name}" "$dur"
+          record_result "$id" "DESKTOP" "UPDATE AVAIL" "sudo apt upgrade" "$dur"
+        else
+          log_card_end "FAILED" "APT upgrade exited ${upg_rc}" "$dur"
+          record_result "$id" "DESKTOP" "FAILED" "APT error (${upg_rc})" "$dur"
+        fi
+      fi
+    else
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "UP TO DATE" "Version ${curr_v} is current" "$dur"
+      record_result "$id" "DESKTOP" "UP TO DATE" "v${curr_v#v}" "$dur"
+    fi
+  else
+    dur="$(elapsed_since "$t_start")"
+    log_card_end "SKIPPED" "v${curr_v} (no supported repo mgr)" "$dur"
+    record_result "$id" "DESKTOP" "SKIPPED" "Unsupported pkg" "$dur"
   fi
 }
 
@@ -777,8 +1785,8 @@ sync_git_desktop_repo() {
 
   log_card_start "$title" "desktop"
   local t_start dirty_count local_sha upstream_ref remote_name branch_name remote_sha dur git_out pull_rc=0 build_rc=0 stashed=0
-  t_start=$(date +%s%N)
-  dirty_count=$(git -C "$repo_dir" status --porcelain 2>/dev/null | wc -l)
+  t_start="$(now_ns)"
+  dirty_count=$(git -C "$repo_dir" status --porcelain 2>/dev/null | wc -l | awk '{print $1}')
   local_sha=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")
   upstream_ref=$(git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "origin/main")
   remote_name="${upstream_ref%%/*}"
@@ -876,13 +1884,13 @@ if [[ "$OUTPUT_FORMAT" != "json" ]]; then
   echo -e "\n${BOLD}${CYAN}╭──────────────────────────────────────────────────────────────╮${RESET}"
   if [[ "$MODE_LABEL" == "check" ]]; then
     banner_txt="🔍 [CHECK MODE] Non-mutating scan (${FILTER_TYPE})..."
-    printf "${BOLD}${CYAN}│${RESET}  ${YELLOW}%-57s${RESET}  ${BOLD}${CYAN}│${RESET}\n" "$banner_txt"
+    printf "${BOLD}${CYAN}│${RESET}  ${YELLOW}%-56s${RESET}  ${BOLD}${CYAN}│${RESET}\n" "$banner_txt"
   elif [[ "$MODE_LABEL" == "clean" ]]; then
     banner_txt="🧹 [CLEANUP MODE] Housekeeping & System Debloat..."
-    printf "${BOLD}${CYAN}│${RESET}  ${BLUE}%-57s${RESET}  ${BOLD}${CYAN}│${RESET}\n" "$banner_txt"
+    printf "${BOLD}${CYAN}│${RESET}  ${BLUE}%-56s${RESET}  ${BOLD}${CYAN}│${RESET}\n" "$banner_txt"
   else
     banner_txt="🚀 [UPDATE MODE] Syncing AI Harnesses & Desktop Apps..."
-    printf "${BOLD}${CYAN}│${RESET}  ${BOLD}%-57s${RESET}  ${BOLD}${CYAN}│${RESET}\n" "$banner_txt"
+    printf "${BOLD}${CYAN}│${RESET}  ${BOLD}%-56s${RESET}  ${BOLD}${CYAN}│${RESET}\n" "$banner_txt"
   fi
   echo -e "${BOLD}${CYAN}╰──────────────────────────────────────────────────────────────╯${RESET}\n"
 fi
@@ -896,20 +1904,21 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
   [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "${BOLD}${CYAN}◈ [SECTION 1] CLI HARNESSES & CORE AGENTS${RESET}\n"
 
   run_self_updater_cli "agy"      "Antigravity CLI (agy)"     "agy"      "update"  "Checking Google Antigravity release channel..." "already on the latest" "success|updated"
-  run_self_updater_cli "claude"   "Claude Code (claude)"       "claude"   "update"  "Connecting to Anthropic update manifest..."     "already.*latest"       "Updated from|successfully updated"
-  run_self_updater_cli "codex"    "OpenAI Codex CLI (codex)"   "codex"    "update"  "Checking standalone binary release..."          "already up to date|latest" "Updated|Installed"
-  run_self_updater_cli "opencode" "OpenCode CLI (opencode)"    "opencode" "upgrade" "Checking upstream OpenCode CLI packages..."     "already installed"     "Upgrade complete|Upgraded"
-  run_self_updater_cli "mimo"     "Xiaomi Mimocode (mimo)"     "mimo"     "upgrade" "Connecting to Xiaomi Mimocode release..."       "already installed"     "Upgrade complete|Upgraded"
-  run_self_updater_cli "kilo"     "Kilo Agent (kilo)"          "kilo"     "upgrade" "Checking Kilo Agent distribution..."            "already installed"     "Upgrade complete|Upgraded"
+  run_self_updater_cli "claude"   "Claude Code (claude)"       "claude"   "update"  "Connecting to Anthropic update manifest..."     "already.*latest|up to date" "Updated from|successfully updated"
+  run_self_updater_cli "codex"    "OpenAI Codex CLI (codex)"   "codex"    "update"  "Checking standalone binary release..."          "already up to date|already.*latest" "Updating Codex CLI from|Updated from"
+  run_self_updater_cli "opencode" "OpenCode CLI (opencode)"    "opencode" "upgrade" "Checking upstream OpenCode CLI packages..."     "already installed|up to date" "Upgrade complete|Upgraded"
+  run_self_updater_cli "mimo"     "Xiaomi Mimocode (mimo)"     "mimo"     "upgrade" "Connecting to Xiaomi Mimocode release..."       "already installed|up to date" "Upgrade complete|Upgraded"
+  run_self_updater_cli "kilo"     "Kilo Agent (kilo)"          "kilo"     "upgrade" "Checking Kilo Agent distribution..."            "already installed|up to date" "Upgrade complete|Upgraded"
   run_self_updater_cli "goose"    "Goose CLI (goose)"          "goose"    "update"  "Checking Goose CLI latest release..."           "already on the latest" "successfully"
 
   # 8. Hermes Agent (supports native --check)
-  if command -v hermes &>/dev/null && should_run "hermes" "cli"; then
+  hermes_bin="$(resolve_bin hermes 2>/dev/null || true)"
+  if [[ -n "$hermes_bin" ]] && should_run "hermes" "cli"; then
     log_card_start "Hermes Agent (hermes)" "cli"
-    t_start=$(date +%s%N)
+    t_start="$(now_ns)"
     if [[ $DRY_RUN -eq 1 ]]; then
       log_step "Probing Hermes Agent git repository (hermes update --check)..."
-      rc=0; output=$(hermes update --check 2>&1) || rc=$?
+      rc=0; output=$("$hermes_bin" update --check 2>&1 | strip_cr) || rc=$?
       printf '%s\n' "$output" | stream_progress 4
       dur="$(elapsed_since "$t_start")"
       if printf '%s\n' "$output" | grep -qiE "Update available|behind"; then
@@ -924,7 +1933,7 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
       fi
     else
       log_step "Updating Hermes dependencies and core engine..."
-      rc=0; output=$(hermes update --yes --no-gateway-restart 2>&1) || rc=$?
+      rc=0; output=$("$hermes_bin" update --yes --no-gateway-restart 2>&1 | strip_cr) || rc=$?
       printf '%s\n' "$output" | stream_progress 4
       dur="$(elapsed_since "$t_start")"
       if printf '%s\n' "$output" | grep -qi "already up to date"; then
@@ -944,9 +1953,10 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
   fi
 
   # 9. Python Tools via uv
-  if command -v uv &>/dev/null && should_run "uv-tools" "cli"; then
+  uv_bin="$(resolve_bin uv 2>/dev/null || true)"
+  if [[ -n "$uv_bin" ]] && should_run "uv-tools" "cli"; then
     log_card_start "Python uv Tools" "cli"
-    t_start=$(date +%s%N)
+    t_start="$(now_ns)"
     if [[ $DRY_RUN -eq 1 ]]; then
       log_step "Checking PyPI versions for installed uv tools..."
       uv_updates=()
@@ -954,12 +1964,12 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
       while read -r pkg ver _; do
         [[ -z "$pkg" || "$pkg" == -* ]] && continue
         ((uv_checked++)) || true
-        pypi_v=$(curl -s --connect-timeout 3 "https://pypi.org/pypi/${pkg}/json" 2>/dev/null | jq -r '.info.version // empty' 2>/dev/null || true)
+        pypi_v=$(curl -s --connect-timeout 3 "https://pypi.org/pypi/${pkg}/json" 2>/dev/null | json_get_stdin "info.version")
         if [[ -n "$pypi_v" ]] && is_version_gt "$pypi_v" "$ver"; then
           uv_updates+=("${pkg}:${ver}→${pypi_v}")
           log_step "Update available: ${pkg} (${ver} → ${pypi_v})"
         fi
-      done < <(uv tool list 2>/dev/null | grep -E '^[a-zA-Z0-9._-]+\s+v?[0-9]')
+      done < <("$uv_bin" tool list 2>/dev/null | strip_cr | grep -E '^[a-zA-Z0-9._-]+\s+v?[0-9]')
       dur="$(elapsed_since "$t_start")"
       if [[ ${#uv_updates[@]} -gt 0 ]]; then
         log_card_end "UPDATE AVAIL" "${#uv_updates[@]} tool(s) upgradable" "$dur"
@@ -970,7 +1980,7 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
       fi
     else
       log_step "Upgrading installed uv tools..."
-      rc=0; output=$(uv tool upgrade --all 2>&1) || rc=$?
+      rc=0; output=$("$uv_bin" tool upgrade --all 2>&1 | strip_cr) || rc=$?
       printf '%s\n' "$output" | stream_progress 4
       dur="$(elapsed_since "$t_start")"
       if [[ $rc -ne 0 ]]; then
@@ -989,10 +1999,62 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
     fi
   fi
 
-  # 10. NPM Global AI Packages
+  # 10. Python pip AI Tools & Agent Packages (Windows & Linux)
+  if ({ [[ ${#PYTHON_CMD[@]} -gt 0 ]] || detect_python; } && run_py -m pip --version &>/dev/null) && should_run "pip-ai" "cli"; then
+    log_card_start "Python pip AI Tools (pip-ai)" "cli"
+    t_start="$(now_ns)"
+    pip_installed=()
+    pip_upgradable=()
+    pip_upgradable_names=()
+
+    while read -r pkg ver; do
+      [[ -z "$pkg" || -z "$ver" ]] && continue
+      pip_installed+=("${pkg}@${ver}")
+      pypi_v=$(curl -s --connect-timeout 3 "https://pypi.org/pypi/${pkg}/json" 2>/dev/null | json_get_stdin "info.version")
+      if [[ -n "$pypi_v" ]] && is_version_gt "$pypi_v" "$ver"; then
+        pip_upgradable+=("${pkg}:${ver}→${pypi_v}")
+        pip_upgradable_names+=("$pkg")
+        log_step "Update available: ${pkg} (${ver} → ${pypi_v})"
+      fi
+    done < <(get_pip_ai_installed)
+
+    if [[ ${#pip_installed[@]} -eq 0 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "No tracked pip AI packages installed" "$dur"
+      record_result "pip-ai" "CLI" "SKIPPED" "None installed" "$dur"
+    elif [[ $DRY_RUN -eq 1 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      if [[ ${#pip_upgradable[@]} -gt 0 ]]; then
+        log_card_end "UPDATE AVAIL" "${#pip_upgradable[@]} package(s) upgradable" "$dur"
+        record_result "pip-ai" "CLI" "UPDATE AVAIL" "${#pip_upgradable[@]} upgradable" "$dur"
+      else
+        log_card_end "UP TO DATE" "${#pip_installed[@]} tracked package(s) current" "$dur"
+        record_result "pip-ai" "CLI" "UP TO DATE" "${#pip_installed[@]} current" "$dur"
+      fi
+    elif [[ ${#pip_upgradable_names[@]} -eq 0 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "UP TO DATE" "${#pip_installed[@]} tracked package(s) current" "$dur"
+      record_result "pip-ai" "CLI" "UP TO DATE" "${#pip_installed[@]} current" "$dur"
+    else
+      log_step "Upgrading ${#pip_upgradable_names[@]} pip AI package(s)..."
+      pip_rc=0
+      run_py -m pip install --upgrade "${pip_upgradable_names[@]}" 2>&1 | strip_cr | stream_progress 4 || pip_rc=$?
+      dur="$(elapsed_since "$t_start")"
+      if [[ $pip_rc -eq 0 ]]; then
+        log_card_end "UPDATED" "Upgraded ${#pip_upgradable_names[@]} package(s)" "$dur"
+        record_result "pip-ai" "CLI" "UPDATED" "${#pip_upgradable_names[@]} upgraded" "$dur"
+      else
+        log_card_end "FAILED" "pip upgrade exited ${pip_rc}" "$dur"
+        record_result "pip-ai" "CLI" "FAILED" "Exit ${pip_rc}" "$dur"
+      fi
+    fi
+  fi
+
+  # 11. NPM Global AI Packages
   if command -v npm &>/dev/null && should_run "npm-globals" "cli"; then
     log_card_start "NPM Global AI Packages" "cli"
-    t_start=$(date +%s%N)
+    t_start="$(now_ns)"
+    init_npm_root_global
     node_root="$(get_npm_root_global)"
     npm_installed=()
     npm_upgradable=()
@@ -1007,7 +2069,7 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
       curr_v="$(get_npm_pkg_version "$pkg")"
       [[ -z "$curr_v" ]] && continue
       npm_installed+=("$pkg")
-      latest_v=$(npm view "$pkg" version 2>/dev/null || true)
+      latest_v=$(npm view "$pkg" version 2>/dev/null | strip_cr || true)
       if [[ -n "$latest_v" ]] && is_version_gt "$latest_v" "$curr_v"; then
         npm_upgradable+=("${pkg}@${latest_v}")
         log_step "Newer version available: ${pkg} (${curr_v} → ${latest_v})"
@@ -1035,7 +2097,7 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
       for target in "${npm_upgradable[@]}"; do
         log_step "Installing ${target}..."
         NPM_DID_UPDATE=1
-        if npm install -g "$target" 2>&1 | stream_progress 3; then
+        if npm install -g "$target" 2>&1 | strip_cr | stream_progress 3; then
           ((npm_updated_count++)) || true
         else
           ((npm_fail_count++)) || true
@@ -1051,6 +2113,62 @@ if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "cli" ]]; then
       fi
     fi
   fi
+
+  # 12. Ollama Runtime (Windows & Linux)
+  ollama_bin="$(resolve_bin ollama 2>/dev/null || true)"
+  if [[ -n "$ollama_bin" ]] && should_run "ollama" "cli"; then
+    log_card_start "Ollama Local Runtime (ollama)" "cli"
+    t_start="$(now_ns)"
+    curr_v="$(get_version ollama)"
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      wg_rc=0
+      run_winget_app "ollama" "Ollama Local Runtime" "CLI" "Ollama.Ollama" "$curr_v" || wg_rc=$?
+      if [[ $wg_rc -eq 2 ]]; then
+        check_github_release_status "ollama" "CLI" "ollama/ollama" "$curr_v" "$t_start"
+      fi
+    elif [[ $IS_MACOS -eq 1 && "$PKG_MGR" == "brew" ]]; then
+      log_step "Checking Homebrew formula for ollama..."
+      dur="$(elapsed_since "$t_start")"
+      if brew outdated ollama 2>/dev/null | grep -q ollama; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+          log_card_end "UPDATE AVAIL" "Newer brew bottle available (local ${curr_v})" "$dur"
+          record_result "ollama" "CLI" "UPDATE AVAIL" "brew outdated" "$dur"
+        else
+          brew upgrade ollama 2>&1 | stream_progress 4
+          dur="$(elapsed_since "$t_start")"
+          log_card_end "UPDATED" "Upgraded via Homebrew" "$dur"
+          record_result "ollama" "CLI" "UPDATED" "$(get_version ollama)" "$dur"
+        fi
+      else
+        log_card_end "UP TO DATE" "Version v${curr_v#v} is current" "$dur"
+        record_result "ollama" "CLI" "UP TO DATE" "v${curr_v#v}" "$dur"
+      fi
+    else
+      check_github_release_status "ollama" "CLI" "ollama/ollama" "$curr_v" "$t_start"
+    fi
+  fi
+
+  # 13. LM Studio CLI / App (Windows & Linux)
+  if should_run "lms" "cli"; then
+  lms_v="$(get_version lms)"
+  if [[ "$lms_v" != "not installed" ]]; then
+    log_card_start "LM Studio (lms)" "cli"
+    t_start="$(now_ns)"
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      wg_rc=0
+      run_winget_app "lms" "LM Studio" "CLI" "ElementLabs.LMStudio" "$lms_v" || wg_rc=$?
+      if [[ $wg_rc -eq 2 ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "SKIPPED" "v${lms_v#v} (self-managed in LM Studio)" "$dur"
+        record_result "lms" "CLI" "SKIPPED" "v${lms_v#v} (self-managed)" "$dur"
+      fi
+    else
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "v${lms_v#v} (self-managed in LM Studio)" "$dur"
+      record_result "lms" "CLI" "SKIPPED" "v${lms_v#v} (self-managed)" "$dur"
+    fi
+  fi
+  fi
 fi
 
 # ==============================================================================
@@ -1059,229 +2177,438 @@ fi
 if [[ "$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "desktop" ]]; then
   [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "${BOLD}${MAGENTA}❖ [SECTION 2] DESKTOP AI APPS & WORKSPACES${RESET}\n"
 
-  # 11. ChatGPT Desktop App
-  if (rpm -q chatgpt &>/dev/null || [[ -d "/Applications/ChatGPT.app" ]]) && should_run "chatgpt" "desktop"; then
+  # 14. ChatGPT Desktop App (Linux RPM/DEB/Flatpak, macOS, Windows MSIX/winget)
+  if should_run "chatgpt" "desktop" && { curr_v="$(get_version chatgpt)"; [[ "$curr_v" != "not installed" ]]; }; then
     log_card_start "ChatGPT Desktop App (chatgpt)" "desktop"
-    t_start=$(date +%s%N)
-    curr_v="$(get_version chatgpt)"
-
-    if [[ "$PKG_MGR" == "dnf" ]]; then
-      log_step "Checking official DNF repository (chatgpt.repo)..."
-      dnf_rc=0
-      dnf_out=$(dnf check-update chatgpt 2>&1) || dnf_rc=$?
-
-      if [[ $dnf_rc -eq 100 ]]; then
-        avail_v=$(printf '%s\n' "$dnf_out" | awk '/chatgpt/ {print $2; exit}')
-        log_step "Found newer version: ${avail_v:-latest} (current: ${curr_v})"
+    t_start="$(now_ns)"
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      wg_rc=0
+      run_winget_app "chatgpt" "ChatGPT Desktop App" "DESKTOP" "OpenAI.ChatGPT" "$curr_v" || wg_rc=$?
+      if [[ $wg_rc -eq 2 ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "SKIPPED" "v${curr_v} (Microsoft Store / self-managed)" "$dur"
+        record_result "chatgpt" "DESKTOP" "SKIPPED" "v${curr_v} (Store managed)" "$dur"
+      fi
+    elif [[ $IS_LINUX -eq 1 ]]; then
+      if command -v flatpak &>/dev/null && flatpak info com.openai.ChatGPT &>/dev/null; then
         if [[ $DRY_RUN -eq 1 ]]; then
           dur="$(elapsed_since "$t_start")"
-          log_card_end "UPDATE AVAIL" "${curr_v} → ${avail_v:-latest}" "$dur"
-          record_result "chatgpt" "DESKTOP" "UPDATE AVAIL" "${avail_v:-latest}" "$dur"
+          log_card_end "SKIPPED" "Flatpak v${curr_v} (use flatpak update)" "$dur"
+          record_result "chatgpt" "DESKTOP" "SKIPPED" "Flatpak v${curr_v}" "$dur"
         else
-          log_step "Attempting DNF upgrade for ChatGPT Desktop..."
-          upg_rc=0
-          run_privileged "ChatGPT Desktop upgrade" dnf upgrade -y chatgpt 2>&1 | stream_progress 4 || upg_rc=$?
+          flatpak update -y com.openai.ChatGPT 2>&1 | stream_progress 4
           dur="$(elapsed_since "$t_start")"
-          if [[ $upg_rc -eq 0 ]]; then
-            log_card_end "UPDATED" "Upgraded via DNF (${avail_v:-latest})" "$dur"
-            record_result "chatgpt" "DESKTOP" "UPDATED" "${avail_v:-Upgraded}" "$dur"
-          elif [[ $upg_rc -eq 1 || $upg_rc -eq 2 ]]; then
-            log_card_end "UPDATE AVAIL" "Auth skipped; run: sudo dnf upgrade -y chatgpt" "$dur"
-            record_result "chatgpt" "DESKTOP" "UPDATE AVAIL" "sudo dnf upgrade" "$dur"
-          else
-            log_card_end "FAILED" "DNF upgrade exited ${upg_rc}" "$dur"
-            record_result "chatgpt" "DESKTOP" "FAILED" "DNF error (${upg_rc})" "$dur"
-          fi
+          log_card_end "UPDATED" "Checked/updated Flatpak" "$dur"
+          record_result "chatgpt" "DESKTOP" "UPDATED" "$(get_version chatgpt)" "$dur"
         fi
-      elif [[ $dnf_rc -ne 0 ]]; then
-        dur="$(elapsed_since "$t_start")"
-        log_card_end "FAILED" "DNF check-update exited ${dnf_rc}" "$dur"
-        record_result "chatgpt" "DESKTOP" "FAILED" "DNF check error" "$dur"
       else
-        dur="$(elapsed_since "$t_start")"
-        log_card_end "UP TO DATE" "Version ${curr_v} is current" "$dur"
-        record_result "chatgpt" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
+        run_linux_pkg_upgrade "chatgpt" "chatgpt" "$curr_v" "$t_start"
       fi
     else
       dur="$(elapsed_since "$t_start")"
-      log_card_end "SKIPPED" "v${curr_v} (auto-upgrade requires DNF)" "$dur"
-      record_result "chatgpt" "DESKTOP" "SKIPPED" "Requires DNF" "$dur"
+      log_card_end "SKIPPED" "v${curr_v} (managed externally)" "$dur"
+      record_result "chatgpt" "DESKTOP" "SKIPPED" "Managed externally" "$dur"
     fi
   fi
 
-  # 12. OpenCode Desktop App
-  if (( command -v rpm &>/dev/null && rpm -q opencode &>/dev/null ) || [[ -d "/opt/OpenCode" ]]) && should_run "opencode-desktop" "desktop"; then
+  # 15. OpenCode Desktop App (Linux RPM/DEB/AppImage, Windows winget/NSIS latest.yml)
+  if should_run "opencode-desktop" "desktop" && { curr_v="$(get_version opencode-desktop)"; [[ "$curr_v" != "not installed" ]]; }; then
     log_card_start "OpenCode Desktop App (opencode-desktop)" "desktop"
-    t_start=$(date +%s%N)
-    curr_v="$(get_version opencode-desktop)"
+    t_start="$(now_ns)"
 
-    if [[ "$curr_v" == "unmanaged" || "$curr_v" == "not installed" || "$ARCH" != "x86_64" || "$PKG_MGR" != "dnf" ]]; then
-      dur="$(elapsed_since "$t_start")"
-      log_card_end "SKIPPED" "Requires x86_64 RPM install (detected: ${curr_v}, ${ARCH}/${PKG_MGR})" "$dur"
-      record_result "opencode-desktop" "DESKTOP" "SKIPPED" "Unsupported pkg" "$dur"
-    else
-      log_step "Inspecting local RPM installation (v${curr_v})..."
-      log_step "Querying OpenCode release manifest (latest-linux.yml)..."
-      yml_data=$(curl -fsSL --connect-timeout 4 https://github.com/anomalyco/opencode/releases/latest/download/latest-linux.yml 2>/dev/null || true)
-      latest_tag=""
-      expected_sha512=""
-      if [[ -n "$yml_data" ]]; then
-        latest_tag=$(printf '%s\n' "$yml_data" | awk '/^version:/ {print $2; exit}' | tr -d "'\"" | sed 's/^v//')
-        expected_sha512=$(printf '%s\n' "$yml_data" | awk '
-          /- url: opencode-desktop-linux-x86_64\.rpm/ {found=1; next}
-          found && /sha512:/ {print $2; exit}
-          found && /- url:/ {exit}
-        ' | tr -d "'\"")
-      else
-        log_step "Falling back to GitHub releases API..."
-        latest_tag=$(curl -s --connect-timeout 4 https://api.github.com/repos/anomalyco/opencode/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
-      fi
-
-      if [[ -z "$latest_tag" ]]; then
-        dur="$(elapsed_since "$t_start")"
-        log_card_end "FAILED" "Could not query upstream OpenCode release" "$dur"
-        record_result "opencode-desktop" "DESKTOP" "FAILED" "Query failed" "$dur"
-      elif is_version_gt "$latest_tag" "$curr_v"; then
-        log_step "Found newer release: v${latest_tag} (local: v${curr_v})"
-        if [[ $DRY_RUN -eq 1 ]]; then
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      wg_rc=0
+      run_winget_app "opencode-desktop" "OpenCode Desktop App" "DESKTOP" "Anomaly.OpenCode.Desktop" "$curr_v" || wg_rc=$?
+      if [[ $wg_rc -eq 2 ]]; then
+        log_step "Querying OpenCode release manifest (latest.yml)..."
+        yml_data=$(curl -fsSL --connect-timeout 4 https://github.com/anomalyco/opencode/releases/latest/download/latest.yml 2>/dev/null | strip_cr || true)
+        win_asset="opencode-desktop-win-x64.exe"
+        [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && win_asset="opencode-desktop-win-arm64.exe"
+        latest_tag=""
+        expected_sha512=""
+        if [[ -n "$yml_data" ]]; then
+          latest_tag=$(printf '%s\n' "$yml_data" | awk '/^version:/ {print $2; exit}' | tr -d "'\"" | sed 's/^v//')
+          expected_sha512=$(printf '%s\n' "$yml_data" | awk -v asset="$win_asset" '
+            $0 ~ "- url: " asset {found=1; next}
+            found && /sha512:/ {print $2; exit}
+            found && /- url:/ {exit}
+          ' | tr -d "'\"")
+        fi
+        if [[ -z "$latest_tag" ]]; then
           dur="$(elapsed_since "$t_start")"
-          log_card_end "UPDATE AVAIL" "v${curr_v} → v${latest_tag}" "$dur"
-          record_result "opencode-desktop" "DESKTOP" "UPDATE AVAIL" "v${latest_tag}" "$dur"
-        else
-          rpm_cache="${HOME}/.cache/@opencode-aidesktop-updater/pending/opencode-desktop-linux-x86_64.rpm"
-          mkdir -p "$(dirname "$rpm_cache")"
-          rpm_url="https://github.com/anomalyco/opencode/releases/download/v${latest_tag}/opencode-desktop-linux-x86_64.rpm"
-
-          need_download=1
-          if [[ -f "$rpm_cache" ]]; then
-            cached_v=$(rpm -qp "$rpm_cache" --queryformat "%{VERSION}" 2>/dev/null || true)
-            if [[ "$cached_v" == "$latest_tag" ]]; then
-              if [[ -z "$expected_sha512" ]] || verify_sha512_b64 "$rpm_cache" "$expected_sha512"; then
-                log_step "Verified ready cached RPM (v${cached_v}) at ${rpm_cache}"
-                need_download=0
+          log_card_end "FAILED" "Could not query upstream OpenCode release" "$dur"
+          record_result "opencode-desktop" "DESKTOP" "FAILED" "Query failed" "$dur"
+        elif is_version_gt "$latest_tag" "$curr_v"; then
+          log_step "Found newer release: v${latest_tag} (local: v${curr_v})"
+          if [[ $DRY_RUN -eq 1 ]]; then
+            dur="$(elapsed_since "$t_start")"
+            log_card_end "UPDATE AVAIL" "v${curr_v} → v${latest_tag}" "$dur"
+            record_result "opencode-desktop" "DESKTOP" "UPDATE AVAIL" "v${latest_tag}" "$dur"
+          else
+            exe_cache="${LOCALAPPDATA_DIR}/@opencode-aidesktop-updater/pending/${win_asset}"
+            mkdir -p "$(dirname "$exe_cache")"
+            exe_url="https://github.com/anomalyco/opencode/releases/download/v${latest_tag}/${win_asset}"
+            log_step "Downloading Windows installer (${win_asset})..."
+            exe_tmp="${exe_cache}.part"
+            if curl -fL --connect-timeout 5 -o "$exe_tmp" "$exe_url" 2>&1 | stream_progress 2; then
+              mv -f "$exe_tmp" "$exe_cache"
+              if [[ -n "$expected_sha512" ]] && ! verify_sha512_b64 "$exe_cache" "$expected_sha512"; then
+                rm -f "$exe_cache"
+                dur="$(elapsed_since "$t_start")"
+                log_card_end "FAILED" "Downloaded installer failed SHA-512 verification" "$dur"
+                record_result "opencode-desktop" "DESKTOP" "FAILED" "Bad checksum" "$dur"
               else
-                log_step "Cached RPM checksum mismatch; re-downloading..."
-                rm -f "$rpm_cache"
+                log_step "SHA-512 verified; running silent NSIS upgrade..."
+                inst_rc=0
+                "$(to_posix_path "$exe_cache")" /S < /dev/null 2>&1 | stream_progress 3 || inst_rc=$?
+                dur="$(elapsed_since "$t_start")"
+                if [[ $inst_rc -eq 0 ]]; then
+                  log_card_end "UPDATED" "Installed v${latest_tag}" "$dur"
+                  record_result "opencode-desktop" "DESKTOP" "UPDATED" "v${latest_tag}" "$dur"
+                else
+                  log_card_end "CACHED" "Installer ready at $(to_native_path "$exe_cache")" "$dur"
+                  record_result "opencode-desktop" "DESKTOP" "CACHED" "Installer ready" "$dur"
+                fi
               fi
+            else
+              rm -f "$exe_tmp"
+              dur="$(elapsed_since "$t_start")"
+              log_card_end "FAILED" "Download failed for v${latest_tag}" "$dur"
+              record_result "opencode-desktop" "DESKTOP" "FAILED" "Download failed" "$dur"
             fi
           fi
+        else
+          dur="$(elapsed_since "$t_start")"
+          log_card_end "UP TO DATE" "Version v${curr_v} is current (latest: v${latest_tag})" "$dur"
+          record_result "opencode-desktop" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
+        fi
+      fi
+    elif [[ $IS_LINUX -eq 1 ]]; then
+      linux_pkg_type=""
+      linux_asset=""
+      if command -v rpm &>/dev/null && rpm -q opencode &>/dev/null && [[ "$ARCH" == "x86_64" && "$PKG_MGR" == "dnf" ]]; then
+        linux_pkg_type="rpm"
+        linux_asset="opencode-desktop-linux-x86_64.rpm"
+      elif command -v dpkg-query &>/dev/null && dpkg-query -W -f='${Status}\n' opencode 2>/dev/null | grep -q "install ok installed"; then
+        linux_pkg_type="deb"
+        linux_asset="opencode-desktop-linux-amd64.deb"
+        [[ "$ARCH" == "aarch64" ]] && linux_asset="opencode-desktop-linux-arm64.deb"
+      elif [[ "$curr_v" != "unmanaged" && "$curr_v" != "not installed" ]] && find_first_appimage 'OpenCode*.AppImage' 'opencode*.AppImage' &>/dev/null; then
+        linux_pkg_type="appimage"
+        linux_asset="opencode-desktop-linux-x86_64.AppImage"
+      fi
 
-          download_ok=0
-          if [[ $need_download -eq 0 ]]; then
-            download_ok=1
+      if [[ -z "$linux_pkg_type" ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "SKIPPED" "Requires RPM/DEB/AppImage install (detected: ${curr_v}, ${ARCH}/${PKG_MGR})" "$dur"
+        record_result "opencode-desktop" "DESKTOP" "SKIPPED" "Unsupported pkg" "$dur"
+      else
+        log_step "Inspecting local ${linux_pkg_type^^} installation (v${curr_v})..."
+        log_step "Querying OpenCode release manifest (latest-linux.yml)..."
+        yml_data=$(curl -fsSL --connect-timeout 4 https://github.com/anomalyco/opencode/releases/latest/download/latest-linux.yml 2>/dev/null || true)
+        latest_tag=""
+        expected_sha512=""
+        if [[ -n "$yml_data" ]]; then
+          latest_tag=$(printf '%s\n' "$yml_data" | awk '/^version:/ {print $2; exit}' | tr -d "'\"" | sed 's/^v//')
+          expected_sha512=$(printf '%s\n' "$yml_data" | awk -v asset="$linux_asset" '
+            $0 ~ "- url: " asset {found=1; next}
+            found && /sha512:/ {print $2; exit}
+            found && /- url:/ {exit}
+          ' | tr -d "'\"")
+        else
+          log_step "Falling back to GitHub releases API..."
+          latest_tag=$(curl -s --connect-timeout 4 https://api.github.com/repos/anomalyco/opencode/releases/latest 2>/dev/null | json_get_stdin "tag_name" | sed 's/^v//')
+        fi
+
+        if [[ -z "$latest_tag" ]]; then
+          dur="$(elapsed_since "$t_start")"
+          log_card_end "FAILED" "Could not query upstream OpenCode release" "$dur"
+          record_result "opencode-desktop" "DESKTOP" "FAILED" "Query failed" "$dur"
+        elif is_version_gt "$latest_tag" "$curr_v"; then
+          log_step "Found newer release: v${latest_tag} (local: v${curr_v})"
+          if [[ $DRY_RUN -eq 1 ]]; then
+            dur="$(elapsed_since "$t_start")"
+            log_card_end "UPDATE AVAIL" "v${curr_v} → v${latest_tag}" "$dur"
+            record_result "opencode-desktop" "DESKTOP" "UPDATE AVAIL" "v${latest_tag}" "$dur"
+          elif [[ "$linux_pkg_type" == "appimage" ]]; then
+            appimg_dest="$(find_first_appimage 'OpenCode*.AppImage' 'opencode*.AppImage')"
+            appimg_url="https://github.com/anomalyco/opencode/releases/download/v${latest_tag}/${linux_asset}"
+            appimg_tmp="${appimg_dest}.part"
+            if curl -fL --connect-timeout 5 -o "$appimg_tmp" "$appimg_url" 2>&1 | stream_progress 2; then
+              if [[ -n "$expected_sha512" ]] && ! verify_sha512_b64 "$appimg_tmp" "$expected_sha512"; then
+                rm -f "$appimg_tmp"
+                dur="$(elapsed_since "$t_start")"
+                log_card_end "FAILED" "AppImage failed SHA-512 verification" "$dur"
+                record_result "opencode-desktop" "DESKTOP" "FAILED" "Bad checksum" "$dur"
+              else
+                chmod +x "$appimg_tmp"
+                mv -f "$appimg_tmp" "$appimg_dest"
+                dur="$(elapsed_since "$t_start")"
+                log_card_end "UPDATED" "Replaced AppImage v${latest_tag}" "$dur"
+                record_result "opencode-desktop" "DESKTOP" "UPDATED" "v${latest_tag}" "$dur"
+              fi
+            else
+              rm -f "$appimg_tmp"
+              dur="$(elapsed_since "$t_start")"
+              log_card_end "FAILED" "Download failed for v${latest_tag}" "$dur"
+              record_result "opencode-desktop" "DESKTOP" "FAILED" "Download failed" "$dur"
+            fi
           else
-            log_step "Downloading RPM package from ${rpm_url}..."
-            rpm_tmp="${rpm_cache}.part"
-            if curl -fL --connect-timeout 5 -o "$rpm_tmp" "$rpm_url" 2>&1 | stream_progress 2; then
-              mv -f "$rpm_tmp" "$rpm_cache"
-              log_step "Downloaded RPM to ${rpm_cache}"
+            pkg_cache="${HOME}/.cache/@opencode-aidesktop-updater/pending/${linux_asset}"
+            mkdir -p "$(dirname "$pkg_cache")"
+            pkg_url="https://github.com/anomalyco/opencode/releases/download/v${latest_tag}/${linux_asset}"
+
+            need_download=1
+            if [[ -f "$pkg_cache" ]]; then
+              cached_v=""
+              if [[ "$linux_pkg_type" == "rpm" ]]; then
+                cached_v=$(rpm -qp "$pkg_cache" --queryformat "%{VERSION}" 2>/dev/null || true)
+              else
+                cached_v=$(dpkg-deb -f "$pkg_cache" Version 2>/dev/null | sed 's/-.*//' || true)
+              fi
+              if [[ "$cached_v" == "$latest_tag" ]]; then
+                if [[ -z "$expected_sha512" ]] || verify_sha512_b64 "$pkg_cache" "$expected_sha512"; then
+                  log_step "Verified ready cached package (v${cached_v}) at ${pkg_cache}"
+                  need_download=0
+                else
+                  log_step "Cached package checksum mismatch; re-downloading..."
+                  rm -f "$pkg_cache"
+                fi
+              fi
+            fi
+
+            download_ok=0
+            if [[ $need_download -eq 0 ]]; then
               download_ok=1
             else
-              rm -f "$rpm_tmp"
-            fi
-          fi
-
-          if [[ $download_ok -eq 1 ]]; then
-            # Integrity & digest verification before privileged install
-            integrity_ok=1
-            if [[ -n "$expected_sha512" ]]; then
-              if verify_sha512_b64 "$rpm_cache" "$expected_sha512"; then
-                log_step "SHA-512 digest verified against latest-linux.yml"
+              log_step "Downloading ${linux_pkg_type^^} package from ${pkg_url}..."
+              pkg_tmp="${pkg_cache}.part"
+              if curl -fL --connect-timeout 5 -o "$pkg_tmp" "$pkg_url" 2>&1 | stream_progress 2; then
+                mv -f "$pkg_tmp" "$pkg_cache"
+                log_step "Downloaded package to ${pkg_cache}"
+                download_ok=1
               else
-                log_step "ERROR: SHA-512 verification failed for ${rpm_cache}"
-                rm -f "$rpm_cache"
+                rm -f "$pkg_tmp"
+              fi
+            fi
+
+            if [[ $download_ok -eq 1 ]]; then
+              integrity_ok=1
+              if [[ -n "$expected_sha512" ]]; then
+                if verify_sha512_b64 "$pkg_cache" "$expected_sha512"; then
+                  log_step "SHA-512 digest verified against latest-linux.yml"
+                else
+                  log_step "ERROR: SHA-512 verification failed for ${pkg_cache}"
+                  rm -f "$pkg_cache"
+                  integrity_ok=0
+                fi
+              fi
+              if [[ $integrity_ok -eq 1 && "$linux_pkg_type" == "rpm" ]] && ! rpm -K --nosignature "$pkg_cache" &>/dev/null; then
+                log_step "ERROR: RPM header/payload integrity check failed"
+                rm -f "$pkg_cache"
                 integrity_ok=0
               fi
-            fi
-            if [[ $integrity_ok -eq 1 ]] && ! rpm -K --nosignature "$rpm_cache" &>/dev/null; then
-              log_step "ERROR: RPM header/payload integrity check failed"
-              rm -f "$rpm_cache"
-              integrity_ok=0
-            fi
 
-            if [[ $integrity_ok -eq 0 ]]; then
-              dur="$(elapsed_since "$t_start")"
-              log_card_end "FAILED" "Downloaded RPM failed integrity check" "$dur"
-              record_result "opencode-desktop" "DESKTOP" "FAILED" "Bad checksum" "$dur"
-            else
-              log_step "Installing verified RPM package (v${latest_tag})..."
-              inst_rc=0
-              run_privileged "OpenCode Desktop RPM installation" rpm -U "$rpm_cache" 2>&1 | stream_progress 4 || inst_rc=$?
-              dur="$(elapsed_since "$t_start")"
-              if [[ $inst_rc -eq 0 ]]; then
-                log_step "Installed RPM package successfully"
-                log_card_end "UPDATED" "Installed v${latest_tag}" "$dur"
-                record_result "opencode-desktop" "DESKTOP" "UPDATED" "v${latest_tag}" "$dur"
-              elif [[ $inst_rc -eq 1 || $inst_rc -eq 2 ]]; then
-                log_step "Privileged installation deferred"
-                log_card_end "CACHED" "Run: sudo rpm -U ${rpm_cache}" "$dur"
-                record_result "opencode-desktop" "DESKTOP" "CACHED" "RPM ready" "$dur"
+              if [[ $integrity_ok -eq 0 ]]; then
+                dur="$(elapsed_since "$t_start")"
+                log_card_end "FAILED" "Downloaded package failed integrity check" "$dur"
+                record_result "opencode-desktop" "DESKTOP" "FAILED" "Bad checksum" "$dur"
               else
-                log_card_end "FAILED" "rpm -U exited ${inst_rc}" "$dur"
-                record_result "opencode-desktop" "DESKTOP" "FAILED" "RPM error (${inst_rc})" "$dur"
+                log_step "Installing verified ${linux_pkg_type^^} package (v${latest_tag})..."
+                inst_rc=0
+                if [[ "$linux_pkg_type" == "rpm" ]]; then
+                  run_privileged "OpenCode Desktop RPM installation" rpm -U "$pkg_cache" 2>&1 | stream_progress 4 || inst_rc=$?
+                else
+                  run_privileged "OpenCode Desktop DEB installation" dpkg -i "$pkg_cache" 2>&1 | stream_progress 4 || inst_rc=$?
+                fi
+                dur="$(elapsed_since "$t_start")"
+                if [[ $inst_rc -eq 0 ]]; then
+                  log_card_end "UPDATED" "Installed v${latest_tag}" "$dur"
+                  record_result "opencode-desktop" "DESKTOP" "UPDATED" "v${latest_tag}" "$dur"
+                elif [[ $inst_rc -eq 1 || $inst_rc -eq 2 ]]; then
+                  log_step "Privileged installation deferred"
+                  local cmd_hint="sudo rpm -U ${pkg_cache}"
+                  [[ "$linux_pkg_type" == "deb" ]] && cmd_hint="sudo dpkg -i ${pkg_cache}"
+                  log_card_end "CACHED" "Run: ${cmd_hint}" "$dur"
+                  record_result "opencode-desktop" "DESKTOP" "CACHED" "${linux_pkg_type^^} ready" "$dur"
+                else
+                  log_card_end "FAILED" "${linux_pkg_type^^} install exited ${inst_rc}" "$dur"
+                  record_result "opencode-desktop" "DESKTOP" "FAILED" "${linux_pkg_type^^} error (${inst_rc})" "$dur"
+                fi
               fi
+            else
+              dur="$(elapsed_since "$t_start")"
+              log_card_end "FAILED" "Download failed for v${latest_tag}" "$dur"
+              record_result "opencode-desktop" "DESKTOP" "FAILED" "Download failed" "$dur"
             fi
-          else
-            dur="$(elapsed_since "$t_start")"
-            log_card_end "FAILED" "Download failed for v${latest_tag}" "$dur"
-            record_result "opencode-desktop" "DESKTOP" "FAILED" "Download failed" "$dur"
           fi
+        else
+          dur="$(elapsed_since "$t_start")"
+          log_card_end "UP TO DATE" "Version v${curr_v} is current (latest: v${latest_tag})" "$dur"
+          record_result "opencode-desktop" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
         fi
-      else
-        dur="$(elapsed_since "$t_start")"
-        log_card_end "UP TO DATE" "Version v${curr_v} is current (latest: v${latest_tag})" "$dur"
-        record_result "opencode-desktop" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
       fi
     fi
   fi
 
-  # 13. AionUi Desktop Workspace (check/notify; no Linux self-install asset configured)
-  if [[ -d "$HOME/.local/opt/AionUi" ]] && should_run "aionui" "desktop"; then
+  # 16. AionUi Desktop Workspace
+  if should_run "aionui" "desktop" && { curr_v="$(get_version aionui)"; [[ "$curr_v" != "not installed" ]]; }; then
     log_card_start "AionUi AI Workspace (aionui)" "desktop"
-    t_start=$(date +%s%N)
-    curr_v=$(get_asar_version "$HOME/.local/opt/AionUi/resources/app.asar")
-    log_step "Reading local app.asar (v${curr_v})..."
-    log_step "Checking GitHub releases for iOfficeAI/AionUi..."
-    latest_tag=$(curl -s --connect-timeout 3 https://api.github.com/repos/iOfficeAI/AionUi/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
-    dur="$(elapsed_since "$t_start")"
-
-    if [[ -z "$latest_tag" ]]; then
-      log_card_end "SKIPPED" "GitHub check unavailable (local v${curr_v})" "$dur"
-      record_result "aionui" "DESKTOP" "SKIPPED" "Check failed" "$dur"
-    elif is_version_gt "$latest_tag" "$curr_v"; then
-      log_step "New release available: v${latest_tag} (manual download)"
-      log_card_end "UPDATE AVAIL" "v${curr_v} → v${latest_tag} (manual)" "$dur"
-      record_result "aionui" "DESKTOP" "UPDATE AVAIL" "v${latest_tag} (manual)" "$dur"
+    t_start="$(now_ns)"
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      wg_rc=0
+      run_winget_app "aionui" "AionUi AI Workspace" "DESKTOP" "iOfficeAI.AionUi" "$curr_v" || wg_rc=$?
+      if [[ $wg_rc -eq 2 ]]; then
+        check_github_release_status "aionui" "DESKTOP" "iOfficeAI/AionUi" "$curr_v" "$t_start"
+      fi
     else
-      log_card_end "UP TO DATE" "Version v${curr_v} is current" "$dur"
-      record_result "aionui" "DESKTOP" "UP TO DATE" "v${curr_v}" "$dur"
+      check_github_release_status "aionui" "DESKTOP" "iOfficeAI/AionUi" "$curr_v" "$t_start"
     fi
   fi
 
-  # 14. Google Antigravity Desktop IDE (local inspection; IDE manages shell)
-  if [[ -d "$HOME/.local/share/antigravity" ]] && should_run "antigravity-desktop" "desktop"; then
+  # 17. Google Antigravity Desktop IDE
+  if should_run "antigravity-desktop" "desktop" && { curr_v="$(get_version antigravity-desktop)"; [[ "$curr_v" != "not installed" ]]; }; then
     log_card_start "Google Antigravity IDE (antigravity-desktop)" "desktop"
-    t_start=$(date +%s%N)
-    curr_v=$(get_asar_version "$HOME/.local/share/antigravity/resources/app.asar")
-    log_step "Local IDE shell v${curr_v} (~/.local/share/antigravity)"
-    log_step "Auto-updated internally by Antigravity Desktop; CLI engine updated via 'agy'"
-    dur="$(elapsed_since "$t_start")"
-    log_card_end "SKIPPED" "IDE v${curr_v} (self-managed)" "$dur"
-    record_result "antigravity-desktop" "DESKTOP" "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+    t_start="$(now_ns)"
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      wg_rc=0
+      run_winget_app "antigravity-desktop" "Google Antigravity IDE" "DESKTOP" "Google.Antigravity" "$curr_v" || wg_rc=$?
+      if [[ $wg_rc -eq 2 ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "SKIPPED" "IDE v${curr_v} (self-managed)" "$dur"
+        record_result "antigravity-desktop" "DESKTOP" "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+      fi
+    elif [[ $IS_LINUX -eq 1 ]] && get_linux_pkg_version antigravity &>/dev/null; then
+      run_linux_pkg_upgrade "antigravity-desktop" "antigravity" "$curr_v" "$t_start"
+    else
+      log_step "Local IDE shell v${curr_v}"
+      log_step "Auto-updated internally by Antigravity Desktop; CLI engine updated via 'agy'"
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "IDE v${curr_v} (self-managed)" "$dur"
+      record_result "antigravity-desktop" "DESKTOP" "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+    fi
   fi
 
-  # 15 & 16. Local Git Desktop Repositories (CoWork-OS & Orkas)
+  # 18. ZhipuAI ZCode Desktop (Windows winget/GitHub SHA256SUMS + Linux repo/GitHub check)
+  if should_run "zcode" "desktop" && { curr_v="$(get_version zcode)"; [[ "$curr_v" != "not installed" ]]; }; then
+    log_card_start "ZhipuAI ZCode Desktop (zcode)" "desktop"
+    t_start="$(now_ns)"
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      wg_rc=0
+      run_winget_app "zcode" "ZhipuAI ZCode Desktop" "DESKTOP" "ZhipuAI.ZCode" "$curr_v" || wg_rc=$?
+      if [[ $wg_rc -eq 2 ]]; then
+        check_github_release_status "zcode" "DESKTOP" "zai-org/ZCode" "$curr_v" "$t_start"
+      fi
+    elif [[ $IS_LINUX -eq 1 ]] && get_linux_pkg_version zcode ZCode &>/dev/null; then
+      pkg_n="zcode"
+      get_linux_pkg_version ZCode &>/dev/null && pkg_n="ZCode"
+      run_linux_pkg_upgrade "zcode" "$pkg_n" "$curr_v" "$t_start"
+    else
+      check_github_release_status "zcode" "DESKTOP" "zai-org/ZCode" "$curr_v" "$t_start"
+    fi
+  fi
+
+  # 19. Microsoft Copilot (Windows Copilot Desktop + Linux gh-copilot)
+  if should_run "copilot" "desktop" && { curr_v="$(get_version copilot)"; [[ "$curr_v" != "not installed" ]]; }; then
+    log_card_start "Microsoft Copilot (copilot)" "desktop"
+    t_start="$(now_ns)"
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      wg_rc=0
+      run_winget_app "copilot" "Microsoft Copilot" "DESKTOP" "Microsoft.365Copilot" "$curr_v" || wg_rc=$?
+      if [[ $wg_rc -eq 2 ]]; then
+        run_winget_app "copilot" "Microsoft Copilot" "DESKTOP" "Microsoft.Copilot" "$curr_v" || wg_rc=$?
+      fi
+      if [[ $wg_rc -eq 2 ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "SKIPPED" "v${curr_v} (Microsoft Store managed)" "$dur"
+        record_result "copilot" "DESKTOP" "SKIPPED" "v${curr_v} (Store)" "$dur"
+      fi
+    else
+      if command -v gh &>/dev/null && gh extension list 2>/dev/null | grep -qi "copilot"; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+          dur="$(elapsed_since "$t_start")"
+          log_card_end "SKIPPED" "v${curr_v} (gh extension lacks --check)" "$dur"
+          record_result "copilot" "DESKTOP" "SKIPPED" "No --check" "$dur"
+        else
+          rc=0; output=$(gh extension upgrade gh-copilot 2>&1) || rc=$?
+          printf '%s\n' "$output" | stream_progress 3
+          dur="$(elapsed_since "$t_start")"
+          if [[ $rc -ne 0 ]]; then
+            log_card_end "FAILED" "gh extension upgrade exited ${rc}" "$dur"
+            record_result "copilot" "DESKTOP" "FAILED" "Exit ${rc}" "$dur"
+          elif printf '%s\n' "$output" | grep -qiE "Successfully|Upgraded"; then
+            log_card_end "UPDATED" "Upgraded gh-copilot" "$dur"
+            record_result "copilot" "DESKTOP" "UPDATED" "$(get_version copilot)" "$dur"
+          else
+            log_card_end "UP TO DATE" "Current (${curr_v})" "$dur"
+            record_result "copilot" "DESKTOP" "UP TO DATE" "${curr_v}" "$dur"
+          fi
+        fi
+      else
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+        record_result "copilot" "DESKTOP" "SKIPPED" "v${curr_v}" "$dur"
+      fi
+    fi
+  fi
+
+  # 20. Anthropic Claude Desktop App (Windows & Linux)
+  if should_run "claude-desktop" "desktop" && { curr_v="$(get_version claude-desktop)"; [[ "$curr_v" != "not installed" ]]; }; then
+    log_card_start "Claude Desktop App (claude-desktop)" "desktop"
+    t_start="$(now_ns)"
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      wg_rc=0
+      run_winget_app "claude-desktop" "Claude Desktop App" "DESKTOP" "Anthropic.Claude" "$curr_v" || wg_rc=$?
+      if [[ $wg_rc -eq 2 ]]; then
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+        record_result "claude-desktop" "DESKTOP" "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+      fi
+    elif [[ $IS_LINUX -eq 1 ]] && get_linux_pkg_version claude-desktop &>/dev/null; then
+      run_linux_pkg_upgrade "claude-desktop" "claude-desktop" "$curr_v" "$t_start"
+    else
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+      record_result "claude-desktop" "DESKTOP" "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+    fi
+  fi
+
+  # 21. OpenAI Codex Desktop App (Windows & Linux)
+  if should_run "codex-desktop" "desktop" && { curr_v="$(get_version codex-desktop)"; [[ "$curr_v" != "not installed" ]]; }; then
+    log_card_start "OpenAI Codex Desktop App (codex-desktop)" "desktop"
+    t_start="$(now_ns)"
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "v${curr_v} (Store/app auto-updated)" "$dur"
+      record_result "codex-desktop" "DESKTOP" "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+    elif [[ $IS_LINUX -eq 1 ]] && get_linux_pkg_version codex-desktop &>/dev/null; then
+      run_linux_pkg_upgrade "codex-desktop" "codex-desktop" "$curr_v" "$t_start"
+    else
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+      record_result "codex-desktop" "DESKTOP" "SKIPPED" "v${curr_v} (self-managed)" "$dur"
+    fi
+  fi
+
+  # 22 & 23. Local Git Desktop Repositories (CoWork-OS & Orkas)
   sync_git_desktop_repo "cowork-os" "CoWork-OS Desktop (~/CoWork-OS)" "$HOME/CoWork-OS" "npm install --silent && npm run build"
   sync_git_desktop_repo "orkas"     "Orkas Desktop Client (~/Orkas)"   "$HOME/Orkas"     "npm install --silent"
 
-  # 17. Hermes Desktop UI
-  if command -v hermes &>/dev/null && should_run "hermes-desktop" "desktop"; then
+  # 24. Hermes Desktop UI
+  if should_run "hermes-desktop" "desktop" && { hermes_desk_v="$(get_version hermes-desktop)"; [[ "$hermes_desk_v" != "not installed" ]]; }; then
     log_card_start "Hermes Desktop UI (hermes-desktop)" "desktop"
-    t_start=$(date +%s%N)
-    log_step "Built/launched on demand via 'hermes desktop' from core hermes-agent checkout"
-    dur="$(elapsed_since "$t_start")"
-    log_card_end "SKIPPED" "Bundled with 'hermes' core" "$dur"
-    record_result "hermes-desktop" "DESKTOP" "SKIPPED" "Bundled w/ hermes" "$dur"
+    t_start="$(now_ns)"
+    if [[ $IS_WINDOWS -eq 1 && "$hermes_desk_v" != "Available" ]]; then
+      log_step "Detected Windows Hermes Desktop MSIX (v${hermes_desk_v})"
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "MSIX v${hermes_desk_v} (Store/AppInstaller)" "$dur"
+      record_result "hermes-desktop" "DESKTOP" "SKIPPED" "MSIX v${hermes_desk_v}" "$dur"
+    else
+      log_step "Built/launched on demand via 'hermes desktop' from core hermes-agent checkout"
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "Bundled with 'hermes' core" "$dur"
+      record_result "hermes-desktop" "DESKTOP" "SKIPPED" "Bundled w/ hermes" "$dur"
+    fi
   fi
 fi
 
@@ -1291,18 +2618,26 @@ fi
 if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean") ]]; then
   [[ "$OUTPUT_FORMAT" != "json" ]] && echo -e "${BOLD}${BLUE}🧹 [SECTION 3] HOUSEKEEPING & SYSTEM DEBLOAT${RESET}\n"
 
-  # 18. Python uv Cache & Environments
-  if command -v uv &>/dev/null && should_run "clean-uv" "clean"; then
+  # 25. Python uv Cache & Environments
+  uv_bin="$(resolve_bin uv 2>/dev/null || true)"
+  uv_cache_dir="$HOME/.cache/uv"
+  [[ $IS_WINDOWS -eq 1 ]] && uv_cache_dir="${LOCALAPPDATA_DIR}/uv/cache"
+  if [[ -n "$uv_bin" || -d "$uv_cache_dir" ]] && should_run "clean-uv" "clean"; then
     log_card_start "Python uv Cache & Environments" "clean"
-    t_start=$(date +%s%N)
+    t_start="$(now_ns)"
     log_step "Checking dangling wheel builds and orphaned cache entries..."
-    if [[ $DRY_RUN -eq 1 ]]; then
-      uv_sz=$(du -sh "$HOME/.cache/uv" 2>/dev/null | awk '{print $1}' || echo "0B")
+    if [[ -z "$uv_bin" ]]; then
+      uv_sz="$(dir_size_human "$uv_cache_dir")"
+      dur="$(elapsed_since "$t_start")"
+      log_card_end "SKIPPED" "uv not installed (${uv_sz} leftover at uv/cache)" "$dur"
+      record_result "clean-uv" "CLEAN" "SKIPPED" "uv missing (${uv_sz})" "$dur"
+    elif [[ $DRY_RUN -eq 1 ]]; then
+      uv_sz="$(dir_size_human "$uv_cache_dir")"
       dur="$(elapsed_since "$t_start")"
       log_card_end "UP TO DATE" "Cache footprint: ${uv_sz}" "$dur"
       record_result "clean-uv" "CLEAN" "UP TO DATE" "Footprint: ${uv_sz}" "$dur"
     else
-      uv_out=$(uv cache prune 2>&1 || true)
+      uv_out=$("$uv_bin" cache prune 2>&1 | strip_cr || true)
       dur="$(elapsed_since "$t_start")"
       if printf '%s\n' "$uv_out" | grep -qi "Removed [1-9]"; then
         uv_files=$(printf '%s\n' "$uv_out" | grep -oE 'Removed [0-9]+ files?' | awk '{print $2 " " $3}')
@@ -1317,12 +2652,14 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
     fi
   fi
 
-  # 19. NPM Cache & Debug Logs
+  # 26. NPM Cache & Debug Logs
   if command -v npm &>/dev/null && should_run "clean-npm" "clean"; then
     log_card_start "NPM Cache & Debug Logs" "clean"
-    t_start=$(date +%s%N)
-    log_count=$(find "$HOME/.npm/_logs" -type f 2>/dev/null | wc -l || echo 0)
-    log_step "Scanning debug logs (~/.npm/_logs: ${log_count} files)..."
+    t_start="$(now_ns)"
+    npm_cache_dir="$(get_npm_cache_dir)"
+    npm_logs_dir="${npm_cache_dir}/_logs"
+    log_count="$(count_files_in_dir "$npm_logs_dir")"
+    log_step "Scanning debug logs (${npm_logs_dir}: ${log_count} files)..."
     if [[ $DRY_RUN -eq 1 ]]; then
       dur="$(elapsed_since "$t_start")"
       log_card_end "UP TO DATE" "${log_count} debug log(s) present" "$dur"
@@ -1331,13 +2668,12 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
       cleaned_npm=0
       gc_info=""
       if [[ $log_count -gt 0 ]]; then
-        rm -rf "$HOME/.npm/_logs/"* 2>/dev/null || true
+        rm -rf "${npm_logs_dir}/"* 2>/dev/null || true
         cleaned_npm=1
       fi
-      # Run expensive full-blob verification only on explicit clean, npm install activity, or cleared logs
       if [[ "$FILTER_TYPE" == "clean" || $NPM_DID_UPDATE -eq 1 || $log_count -gt 0 ]]; then
         log_step "Verifying cache integrity (npm cache verify)..."
-        npm_out=$(npm cache verify 2>&1 || true)
+        npm_out=$(npm cache verify 2>&1 | strip_cr || true)
         gc_count=$(printf '%s\n' "$npm_out" | awk -F: '/Content garbage-collected/ {print $2}' | awk '{print $1}')
         gc_bytes=$(printf '%s\n' "$npm_out" | grep -i "Content garbage-collected" | grep -oE '\([0-9]+ bytes\)' | tr -d '() bytes' || true)
         if [[ -n "$gc_count" && "$gc_count" -gt 0 ]]; then
@@ -1358,21 +2694,21 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
     fi
   fi
 
-  # 20. Python Pip Wheel Cache
-  if command -v pip &>/dev/null && should_run "clean-pip" "clean"; then
+  # 27. Python Pip Wheel Cache
+  if ({ [[ ${#PYTHON_CMD[@]} -gt 0 ]] || detect_python; } && run_py -m pip --version &>/dev/null) && should_run "clean-pip" "clean"; then
     log_card_start "Python Pip Cache" "clean"
-    t_start=$(date +%s%N)
+    t_start="$(now_ns)"
     if [[ $DRY_RUN -eq 1 ]]; then
-      pip_sz=$(pip cache info 2>/dev/null | awk -F: '/Package index page cache size/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
+      pip_sz=$(run_py -m pip cache info 2>/dev/null | strip_cr | awk -F: '/Package index page cache size/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
       dur="$(elapsed_since "$t_start")"
       log_card_end "UP TO DATE" "Cache footprint: ${pip_sz:-0B}" "$dur"
       record_result "clean-pip" "CLEAN" "UP TO DATE" "Footprint: ${pip_sz:-0B}" "$dur"
     else
       log_step "Purging cached wheel downloads and HTTP index files..."
-      pip_out=$(pip cache purge 2>&1 || true)
+      pip_out=$(run_py -m pip cache purge 2>&1 | strip_cr || true)
       dur="$(elapsed_since "$t_start")"
-      removed_files=$(printf '%s\n' "$pip_out" | sed -n 's/^Files removed: \([0-9]\+\).*/\1/p' | head -n 1)
-      removed_size=$(printf '%s\n' "$pip_out" | sed -n 's/^Files removed: [0-9]\+ (\([^)]*\)).*/\1/p' | head -n 1)
+      removed_files=$(printf '%s\n' "$pip_out" | sed -n 's/^Files removed: \([0-9][0-9]*\).*/\1/p' | head -n 1)
+      removed_size=$(printf '%s\n' "$pip_out" | sed -n 's/^Files removed: [0-9][0-9]* (\([^)]*\)).*/\1/p' | head -n 1)
       if [[ -n "$removed_files" && "$removed_files" -gt 0 ]]; then
         log_card_end "CLEANED" "Purged ${removed_files} files (${removed_size:-0B})" "$dur"
         record_result "clean-pip" "CLEAN" "CLEANED" "${removed_files} files (${removed_size:-0B})" "$dur"
@@ -1383,43 +2719,106 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
     fi
   fi
 
-  # 21. Desktop Updater Packages & Temp Installers
+  # 28. Desktop Updater Packages & Temp Installers
   if should_run "clean-installers" "clean"; then
     log_card_start "Desktop Updater Packages & Temp Installers" "clean"
-    t_start=$(date +%s%N)
-    rpm_cache="$HOME/.cache/@opencode-aidesktop-updater/pending/opencode-desktop-linux-x86_64.rpm"
+    t_start="$(now_ns)"
     installer_status="UP TO DATE"
     installer_detail="No stale installers"
     installer_short=""
+    reclaimed_list=()
+    kept_list=()
 
-    if [[ -f "$rpm_cache" ]] && command -v rpm &>/dev/null; then
-      cached_v=$(rpm -qp "$rpm_cache" --queryformat "%{VERSION}" 2>/dev/null || true)
-      curr_v=$(rpm -q --queryformat "%{VERSION}" opencode 2>/dev/null || true)
-      sz=$(du -sh "$rpm_cache" 2>/dev/null | awk '{print $1}')
-      if [[ -n "$curr_v" && -n "$cached_v" ]] && ! is_version_gt "$cached_v" "$curr_v"; then
-        if [[ $DRY_RUN -eq 1 ]]; then
-          installer_status="UPDATE AVAIL"
-          installer_detail="Reclaimable RPM (${sz})"
+    if [[ $IS_LINUX -eq 1 ]]; then
+      rpm_cache="$HOME/.cache/@opencode-aidesktop-updater/pending/opencode-desktop-linux-x86_64.rpm"
+      deb_cache="$HOME/.cache/@opencode-aidesktop-updater/pending/opencode-desktop-linux-amd64.deb"
+      if [[ -f "$rpm_cache" ]] && command -v rpm &>/dev/null; then
+        cached_v=$(rpm -qp "$rpm_cache" --queryformat "%{VERSION}" 2>/dev/null || true)
+        curr_v=$(rpm -q --queryformat "%{VERSION}" opencode 2>/dev/null || true)
+        sz=$(dir_size_human "$(dirname "$rpm_cache")")
+        if [[ -n "$curr_v" && -n "$cached_v" ]] && ! is_version_gt "$cached_v" "$curr_v"; then
+          if [[ $DRY_RUN -eq 1 ]]; then
+            reclaimed_list+=("OpenCode RPM (${sz})")
+          else
+            rm -rf "$HOME/.cache/@opencode-aidesktop-updater/pending"* 2>/dev/null || true
+            reclaimed_list+=("OpenCode RPM (${sz})")
+          fi
         else
-          rm -rf "$HOME/.cache/@opencode-aidesktop-updater/pending"* 2>/dev/null || true
-          installer_status="CLEANED"
-          installer_detail="Removed installed RPM (${sz})"
+          kept_list+=("OpenCode v${cached_v:-RPM} (${sz})")
         fi
-      else
-        installer_status="CACHED"
-        installer_detail="Pending v${cached_v:-RPM} kept (${sz})"
-        installer_short="Kept v${cached_v:-RPM} (${sz})"
+      fi
+      if [[ -f "$deb_cache" ]] && command -v dpkg-deb &>/dev/null; then
+        cached_v=$(dpkg-deb -f "$deb_cache" Version 2>/dev/null | sed 's/-.*//' || true)
+        curr_v=$(get_linux_pkg_version opencode opencode-desktop || true)
+        sz=$(dir_size_human "$(dirname "$deb_cache")")
+        if [[ -n "$curr_v" && -n "$cached_v" ]] && ! is_version_gt "$cached_v" "$curr_v"; then
+          if [[ $DRY_RUN -eq 1 ]]; then
+            reclaimed_list+=("OpenCode DEB (${sz})")
+          else
+            rm -rf "$HOME/.cache/@opencode-aidesktop-updater/pending"* 2>/dev/null || true
+            reclaimed_list+=("OpenCode DEB (${sz})")
+          fi
+        else
+          kept_list+=("OpenCode v${cached_v:-DEB} (${sz})")
+        fi
+      fi
+    elif [[ $IS_WINDOWS -eq 1 ]]; then
+      zcode_inst="${LOCALAPPDATA_DIR}/@zcodedesktop-updater/installer.exe"
+      if [[ -f "$zcode_inst" ]]; then
+        cached_v="$(get_pe_version "$zcode_inst" | awk -F. '{if(NF>=3) print $1"."$2"."$3; else print $0}' || true)"
+        curr_v="$(get_version zcode)"
+        sz="$(dir_size_human "${LOCALAPPDATA_DIR}/@zcodedesktop-updater")"
+        if [[ "$curr_v" != "not installed" && -n "$cached_v" ]] && ! is_version_gt "$cached_v" "$curr_v"; then
+          if [[ $DRY_RUN -eq 1 ]]; then
+            reclaimed_list+=("ZCode v${cached_v} (${sz})")
+          else
+            rm -f "$zcode_inst" 2>/dev/null || true
+            reclaimed_list+=("ZCode v${cached_v} (${sz})")
+          fi
+        else
+          kept_list+=("ZCode v${cached_v:-exe} (${sz})")
+        fi
+      fi
+      opencode_win_pending="${LOCALAPPDATA_DIR}/@opencode-aidesktop-updater/pending"
+      if [[ -d "$opencode_win_pending" ]]; then
+        sz="$(dir_size_human "$opencode_win_pending")"
+        curr_v="$(get_version opencode-desktop)"
+        if [[ "$curr_v" != "not installed" && "$sz" != "0B" ]]; then
+          if [[ $DRY_RUN -eq 1 ]]; then
+            reclaimed_list+=("OpenCode installer (${sz})")
+          else
+            rm -rf "$opencode_win_pending" 2>/dev/null || true
+            reclaimed_list+=("OpenCode installer (${sz})")
+          fi
+        fi
       fi
     fi
+
+    if [[ ${#reclaimed_list[@]} -gt 0 ]]; then
+      if [[ $DRY_RUN -eq 1 ]]; then
+        installer_status="UPDATE AVAIL"
+        installer_detail="Reclaimable: ${reclaimed_list[*]}"
+        installer_short="Reclaimable (${#reclaimed_list[@]})"
+      else
+        installer_status="CLEANED"
+        installer_detail="Removed: ${reclaimed_list[*]}"
+        installer_short="Removed ${#reclaimed_list[@]} pkg(s)"
+      fi
+    elif [[ ${#kept_list[@]} -gt 0 ]]; then
+      installer_status="CACHED"
+      installer_detail="Pending kept: ${kept_list[*]}"
+      installer_short="Kept ${#kept_list[@]} pending"
+    fi
+
     dur="$(elapsed_since "$t_start")"
     log_card_end "$installer_status" "$installer_detail" "$dur"
     record_result "clean-installers" "CLEAN" "$installer_status" "${installer_short:-$installer_detail}" "$dur"
   fi
 
-  # 22. Local AI Git Repositories (git gc --auto)
+  # 29. Local AI Git Repositories (git gc --auto)
   if should_run "clean-git" "clean"; then
     log_card_start "Local AI Git Repositories (git gc --auto)" "clean"
-    t_start=$(date +%s%N)
+    t_start="$(now_ns)"
     repos_checked=0
     repos_packed=0
     for r in "$HOME/CoWork-OS" "$HOME/Orkas"; do
@@ -1452,68 +2851,110 @@ if [[ $DO_CLEANUP -eq 1 && ("$FILTER_TYPE" == "all" || "$FILTER_TYPE" == "clean"
     fi
   fi
 
-  # 23. Cached Electron Distribution Archives
-  if [[ -d "$HOME/.cache/electron" ]] && should_run "clean-electron" "clean"; then
+  # 30. Cached Electron Distribution Archives
+  electron_cache_dir="$HOME/.cache/electron"
+  [[ $IS_WINDOWS -eq 1 ]] && electron_cache_dir="${LOCALAPPDATA_DIR}/electron/Cache"
+  if [[ -d "$electron_cache_dir" ]] && should_run "clean-electron" "clean"; then
     log_card_start "Cached Electron Distribution Archives" "clean"
-    t_start=$(date +%s%N)
-    log_step "Scanning cached distribution zips >7 days old (~/.cache/electron)..."
-    old_zips=$(find "$HOME/.cache/electron" -type f -name "*.zip" -mtime +7 2>/dev/null | wc -l || echo 0)
-    if [[ $old_zips -gt 0 && $DRY_RUN -eq 0 ]]; then
-      old_sz=$(find "$HOME/.cache/electron" -type f -name "*.zip" -mtime +7 -exec du -cb {} + 2>/dev/null | tail -n 1 | awk '{printf "%.1fMB", $1/1048576}')
-      find "$HOME/.cache/electron" -type f -name "*.zip" -mtime +7 -delete 2>/dev/null || true
-      find "$HOME/.cache/electron" -type d -empty -delete 2>/dev/null || true
+    t_start="$(now_ns)"
+    log_step "Scanning cached distribution zips >7 days old (${electron_cache_dir})..."
+    if [[ $DRY_RUN -eq 1 ]]; then
+      read -r old_zips old_sz <<< "$(scan_or_prune_old_files scan "*.zip" 7 "$electron_cache_dir")"
       dur="$(elapsed_since "$t_start")"
-      log_card_end "CLEANED" "Pruned ${old_zips} archive(s) (${old_sz:-pruned})" "$dur"
-      record_result "clean-electron" "CLEAN" "CLEANED" "${old_zips} (${old_sz})" "$dur"
+      if [[ "${old_zips:-0}" -gt 0 ]]; then
+        log_card_end "UPDATE AVAIL" "${old_zips} stale (>7d) archive(s) (${old_sz})" "$dur"
+        record_result "clean-electron" "CLEAN" "UPDATE AVAIL" "${old_zips} (${old_sz})" "$dur"
+      else
+        log_card_end "UP TO DATE" "0 stale (>7d) archives" "$dur"
+        record_result "clean-electron" "CLEAN" "UP TO DATE" "0 stale" "$dur"
+      fi
     else
+      read -r old_zips old_sz <<< "$(scan_or_prune_old_files prune "*.zip" 7 "$electron_cache_dir")"
       dur="$(elapsed_since "$t_start")"
-      log_card_end "UP TO DATE" "${old_zips} stale (>7d) archives" "$dur"
-      record_result "clean-electron" "CLEAN" "UP TO DATE" "${old_zips} stale" "$dur"
+      if [[ "${old_zips:-0}" -gt 0 ]]; then
+        log_card_end "CLEANED" "Pruned ${old_zips} archive(s) (${old_sz})" "$dur"
+        record_result "clean-electron" "CLEAN" "CLEANED" "${old_zips} (${old_sz})" "$dur"
+      else
+        log_card_end "UP TO DATE" "0 stale (>7d) archives" "$dur"
+        record_result "clean-electron" "CLEAN" "UP TO DATE" "0 stale" "$dur"
+      fi
     fi
   fi
 
-  # 24. System Package Manager Cache Debloat (DNF)
-  if command -v dnf &>/dev/null && should_run "clean-dnf" "clean"; then
-    log_card_start "System Package Cache (DNF)" "clean"
-    t_start=$(date +%s%N)
+  # 31. System Package Manager Cache Debloat (DNF / APT)
+  if [[ $IS_LINUX -eq 1 ]] && { command -v dnf &>/dev/null || command -v apt-get &>/dev/null; } && should_run "clean-dnf" "clean"; then
+    log_card_start "System Package Cache (DNF/APT)" "clean"
+    t_start="$(now_ns)"
     if [[ $DRY_RUN -eq 1 ]]; then
       dur="$(elapsed_since "$t_start")"
-      log_card_end "UP TO DATE" "System RPM cache check requires root" "$dur"
+      log_card_end "UP TO DATE" "System package cache check requires root" "$dur"
       record_result "clean-dnf" "CLEAN" "UP TO DATE" "Needs root check" "$dur"
     elif sudo -n true 2>/dev/null; then
-      log_step "Cleaning root DNF package cache (sudo dnf clean packages)..."
-      dnf_clean_out=$(sudo dnf clean packages 2>&1 || true)
-      dur="$(elapsed_since "$t_start")"
-      removed_rpm=$(printf '%s\n' "$dnf_clean_out" | sed -n 's/Removed \([0-9]\+\) files.*/\1/p' | head -n 1)
-      if [[ -n "$removed_rpm" && "$removed_rpm" -gt 0 ]]; then
-        log_card_end "CLEANED" "Removed ${removed_rpm} cached RPM files" "$dur"
-        record_result "clean-dnf" "CLEAN" "CLEANED" "${removed_rpm} RPMs purged" "$dur"
+      if command -v dnf &>/dev/null; then
+        log_step "Cleaning root DNF package cache (sudo dnf clean packages)..."
+        dnf_clean_out=$(sudo dnf clean packages 2>&1 || true)
+        dur="$(elapsed_since "$t_start")"
+        removed_rpm=$(printf '%s\n' "$dnf_clean_out" | sed -n 's/Removed \([0-9][0-9]*\) files.*/\1/p' | head -n 1)
+        if [[ -n "$removed_rpm" && "$removed_rpm" -gt 0 ]]; then
+          log_card_end "CLEANED" "Removed ${removed_rpm} cached RPM files" "$dur"
+          record_result "clean-dnf" "CLEAN" "CLEANED" "${removed_rpm} RPMs purged" "$dur"
+        else
+          log_card_end "UP TO DATE" "DNF package cache empty" "$dur"
+          record_result "clean-dnf" "CLEAN" "UP TO DATE" "Cache empty" "$dur"
+        fi
       else
-        log_card_end "UP TO DATE" "DNF package cache empty" "$dur"
-        record_result "clean-dnf" "CLEAN" "UP TO DATE" "Cache empty" "$dur"
+        log_step "Cleaning APT package cache (sudo apt-get autoclean)..."
+        sudo apt-get autoclean -y &>/dev/null || true
+        dur="$(elapsed_since "$t_start")"
+        log_card_end "CLEANED" "Pruned obsolete APT archives" "$dur"
+        record_result "clean-dnf" "CLEAN" "CLEANED" "APT autocleaned" "$dur"
       fi
     else
       dur="$(elapsed_since "$t_start")"
-      log_card_end "SKIPPED" "Requires active sudo for /var/cache/libdnf5" "$dur"
+      log_card_end "SKIPPED" "Requires active sudo for package cache" "$dur"
       record_result "clean-dnf" "CLEAN" "SKIPPED" "Needs sudo" "$dur"
     fi
   fi
 
-  # 25. Stale Crashpad Dumps
+  # 32. Stale Crashpad Dumps
   if should_run "clean-dumps" "clean"; then
     log_card_start "Stale Crash Dumps & Minidumps" "clean"
-    t_start=$(date +%s%N)
+    t_start="$(now_ns)"
     log_step "Scanning for *.dmp crash dumps older than 7 days..."
-    dmp_count=$(find "$HOME/.config" "$HOME/.cache" -type f -name "*.dmp" -mtime +7 2>/dev/null | wc -l || echo 0)
-    if [[ $dmp_count -gt 0 && $DRY_RUN -eq 0 ]]; then
-      find "$HOME/.config" "$HOME/.cache" -type f -name "*.dmp" -mtime +7 -delete 2>/dev/null || true
-      dur="$(elapsed_since "$t_start")"
-      log_card_end "CLEANED" "Pruned ${dmp_count} stale crash dump(s)" "$dur"
-      record_result "clean-dumps" "CLEAN" "CLEANED" "${dmp_count} purged" "$dur"
+    declare -a dump_dirs=()
+    if [[ $IS_WINDOWS -eq 1 ]]; then
+      dump_dirs=(
+        "${LOCALAPPDATA_DIR}/CrashDumps"
+        "${HOME}/.zcode/v2/crash"
+        "${HOME}/.gemini/antigravity-cli/crashes"
+      )
+      for _d in "${LOCALAPPDATA_DIR}"/*/Crashpad "${APPDATA_DIR}"/*/Crashpad; do
+        [[ -d "$_d" ]] && dump_dirs+=("$_d")
+      done
     else
+      dump_dirs=("$HOME/.config" "$HOME/.cache")
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+      read -r dmp_count dmp_sz <<< "$(scan_or_prune_old_files scan "*.dmp" 7 "${dump_dirs[@]}")"
       dur="$(elapsed_since "$t_start")"
-      log_card_end "UP TO DATE" "0 stale crash dumps (>7d)" "$dur"
-      record_result "clean-dumps" "CLEAN" "UP TO DATE" "0 stale dumps" "$dur"
+      if [[ "${dmp_count:-0}" -gt 0 ]]; then
+        log_card_end "UPDATE AVAIL" "${dmp_count} stale (>7d) dump(s) (${dmp_sz})" "$dur"
+        record_result "clean-dumps" "CLEAN" "UPDATE AVAIL" "${dmp_count} (${dmp_sz})" "$dur"
+      else
+        log_card_end "UP TO DATE" "0 stale crash dumps (>7d)" "$dur"
+        record_result "clean-dumps" "CLEAN" "UP TO DATE" "0 stale dumps" "$dur"
+      fi
+    else
+      read -r dmp_count dmp_sz <<< "$(scan_or_prune_old_files prune "*.dmp" 7 "${dump_dirs[@]}")"
+      dur="$(elapsed_since "$t_start")"
+      if [[ "${dmp_count:-0}" -gt 0 ]]; then
+        log_card_end "CLEANED" "Pruned ${dmp_count} stale crash dump(s) (${dmp_sz})" "$dur"
+        record_result "clean-dumps" "CLEAN" "CLEANED" "${dmp_count} purged" "$dur"
+      else
+        log_card_end "UP TO DATE" "0 stale crash dumps (>7d)" "$dur"
+        record_result "clean-dumps" "CLEAN" "UP TO DATE" "0 stale dumps" "$dur"
+      fi
     fi
   fi
 fi
@@ -1543,7 +2984,7 @@ for s in "${REPORT_STATUS[@]:-}"; do
 done
 
 if [[ "$OUTPUT_FORMAT" == "json" ]]; then
-  python3 -c '
+  run_py -c '
 import json, sys
 
 sep = "__AIUP_SEP__"
@@ -1584,7 +3025,7 @@ summary = {
 }
 print(json.dumps(summary, indent=2))
 ' \
-    "$VERSION" "$OS" "$ARCH" "$PKG_MGR" "$MODE_LABEL" \
+    "$VERSION" "$HOST_OS" "$ARCH" "$PKG_MGR" "$MODE_LABEL" \
     "$(printf "%s__AIUP_SEP__" "${REPORT_NAMES[@]:-}")" \
     "$(printf "%s__AIUP_SEP__" "${REPORT_TYPES[@]:-}")" \
     "$(printf "%s__AIUP_SEP__" "${REPORT_STATUS[@]:-}")" \
@@ -1647,7 +3088,7 @@ summary_footer="  ${BOLD}Total:${RESET} ${#REPORT_NAMES[@]} items  │  ${GREEN}
 echo -e "${summary_footer}\n"
 
 # Desktop Notification (if in active GUI session)
-if command -v notify-send &>/dev/null && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+if [[ $IS_LINUX -eq 1 ]] && command -v notify-send &>/dev/null && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
   notify_msg="${count_uptodate} Up-to-date, ${count_updated} Updated"
   [[ $count_cleaned -gt 0 ]] && notify_msg+=", ${count_cleaned} Cleaned"
   [[ $count_avail -gt 0 ]] && notify_msg+=", ${count_avail} Available"
@@ -1655,6 +3096,22 @@ if command -v notify-send &>/dev/null && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}
   notify-send -a "aiup" -i "dialog-information" "⚡ AIUP Sync Finished" "$notify_msg" 2>/dev/null || true
 elif [[ $IS_MACOS -eq 1 ]]; then
   osascript -e "display notification \"${count_uptodate} Up-to-date, ${count_updated} Updated, ${count_cleaned} Cleaned\" with title \"⚡ AIUP Sync Finished\"" 2>/dev/null || true
+elif [[ $IS_WINDOWS -eq 1 && -t 1 && "$MODE_LABEL" == "update" ]] && [[ "${CI:-}" != "true" && "${AIUP_NONINTERACTIVE:-}" != "1" ]]; then
+  win_msg="${count_uptodate} Up-to-date, ${count_updated} Updated"
+  [[ $count_cleaned -gt 0 ]] && win_msg+=", ${count_cleaned} Cleaned"
+  [[ $count_avail -gt 0 ]] && win_msg+=", ${count_avail} Available"
+  [[ $count_failed -gt 0 ]] && win_msg+=", ${count_failed} Failed"
+  powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "
+    try {
+      [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] > \$null
+      \$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+      \$nodes = \$xml.GetElementsByTagName('text')
+      \$nodes[0].AppendChild(\$xml.CreateTextNode('AIUP Sync Finished')) > \$null
+      \$nodes[1].AppendChild(\$xml.CreateTextNode('$win_msg')) > \$null
+      \$toast = [Windows.UI.Notifications.ToastNotification]::new(\$xml)
+      [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Microsoft.WindowsTerminal_8wekyb3d8bbwe!App').Show(\$toast)
+    } catch {}
+  " </dev/null >/dev/null 2>&1 || true
 fi
 
 [[ $count_failed -gt 0 ]] && exit 1

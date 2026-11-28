@@ -1,7 +1,7 @@
 #compdef aiup uai update-ai-harnesses
 
 _aiup() {
-  local -a opts targets
+  local -a opts
 
   opts=(
     '(-h --help)'{-h,--help}'[Show help documentation]'
@@ -11,7 +11,7 @@ _aiup() {
     '(-C --clean)'{-C,--clean}'[Perform housekeeping, cache purge & system debloat only]'
     '--no-clean[Skip post-update housekeeping and cache debloat]'
     '(-S --sudo)'{-S,--sudo}'[Pre-authenticate sudo upfront at startup]'
-    '--no-sudo[Disable all sudo prompts (skip/cache privileged updates)]'
+    '--no-sudo[Disable all elevation prompts (skip/cache privileged updates)]'
     '--cli[Only target CLI harnesses and agent runtimes]'
     '--desktop[Only target Desktop AI apps and UI workspaces]'
     '(-o --only)'{-o,--only}'[Only update specified target(s)]:target:_aiup_targets'
@@ -36,11 +36,18 @@ _aiup_targets() {
     'kilo:Kilo Agent CLI'
     'goose:Block Goose CLI'
     'uv-tools:Python uv managed tools'
-    'npm-globals:Global npm packages (command-code, qwen-code, cline)'
+    'pip-ai:Python pip AI packages and CLIs'
+    'npm-globals:Global npm AI packages'
+    'ollama:Ollama local LLM runtime'
+    'lms:LM Studio CLI and runtime'
     'chatgpt:ChatGPT Desktop App'
     'opencode-desktop:OpenCode Desktop App'
     'aionui:AionUi Desktop Workspace'
     'antigravity-desktop:Google Antigravity IDE'
+    'zcode:ZhipuAI ZCode Desktop'
+    'copilot:Microsoft Copilot Desktop / gh-copilot'
+    'claude-desktop:Anthropic Claude Desktop App'
+    'codex-desktop:OpenAI Codex Desktop App'
     'cowork-os:CoWork-OS Desktop and repo'
     'orkas:Orkas Desktop Client'
     'hermes-desktop:Hermes Desktop UI'
