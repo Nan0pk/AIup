@@ -1,4 +1,4 @@
-# ⚡ aiup (Universal AI Harness & Desktop App Updater)
+# ⚡ Aiup (Universal AI Harness & Desktop App Updater)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Fedora%20%7C%20Linux-lightgrey.svg)]()
